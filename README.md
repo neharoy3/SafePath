@@ -1,10 +1,10 @@
-# SafePath
+# SafePath 🗺️📍
 
-## Purpose
+## ⚠️ Problem Statement
 
 SafePath is a safety-focused navigation platform that helps users plan and travel more securely by providing real-time route safety scoring, community-driven safety reporting, and emergency SOS features with peer-to-peer responder coordination.
 
-## Solution
+## 📝 Our Solution
 
 SafePath addresses safety concerns during travel through:
 
@@ -14,13 +14,14 @@ SafePath addresses safety concerns during travel through:
 - **User Profiles**: Profile management with emergency contacts and credit-based helper incentives for SOS responses
 - **SMS Integration**: Twilio-powered SMS notifications for emergency alerts and critical updates
 
-## Tech Stack
+## ⚙️ Tech Stack
 
 **Frontend**
 
 - React + React Router for UI and client-side routing
 - Vite for fast bundling and development
 - Firebase Authentication for user registration/login
+- Firebase Firestore for user profile persistence
 - Firebase Realtime Database for live updates
 - Leaflet + React-Leaflet for map visualization
 - Tailwind CSS for styling
@@ -36,30 +37,30 @@ SafePath addresses safety concerns during travel through:
 
 **Integrations**
 
-- Firebase (Auth, Realtime DB)
+- Firebase (Auth, Firestore, Realtime DB)
 - Twilio (SMS)
 - OSRM (Routing)
 - Nominatim (Geocoding)
 
-## Architecture
+## 🛠️ Architecture
 
 ### System Overview
 
 ```
 ┌─────────────────────────────────────────────────────┐
 │           React Frontend (Vite)                     │
-│  ├─ Auth: Firebase Authentication                  │
-│  ├─ Components: Journey Planner, Map, SOS Panel    │
-│  └─ Services: Location, Routes, Safety, SOS        │
+│  ├─ Auth: Firebase Authentication                   │
+│  ├─ Components: Journey Planner, Map, SOS Panel     │
+│  └─ Services: Location, Routes, Safety, SOS         │
 └──────────────┬──────────────────────────────────────┘
                │ HTTPS/HTTP
                ▼
 ┌─────────────────────────────────────────────────────┐
-│        FastAPI Backend (Port 8001)                  │
-│  ├─ REST API: /api/routes, /api/search, /users     │
-│  ├─ SOS System: /sos/trigger, /sos/respond         │
-│  ├─ Safety Data: Segments, Reports, Scores        │
-│  └─ Database: SQLModel ORM with SQLite             │
+│        FastAPI Backend (Port 8000)                  │
+│  ├─ REST API: /api/routes, /api/search, /users      │
+│  ├─ SOS System: /api/sos/alert, /respond, /resolve  │
+│  ├─ Safety Data: Segments, Reports, Scores          │
+│  └─ Database: SQLModel ORM with SQLite              │
 └─────────────────────────────────────────────────────┘
                │
         ┌──────┼──────┬─────────┐
@@ -85,36 +86,40 @@ SafePath addresses safety concerns during travel through:
 
 - `src/App.jsx`: Main app routing
 - `src/components/`: UI components (Auth, Journey Planner, Map, SOS, etc.)
+- `src/config/firebase.js`: Firebase initialization via Vite env vars
 - `src/utils/`:
   - `firebaseAuth.js`: Register/login/logout flows
-  - `locationService.js`: GPS tracking
+  - `locationService.js`: Realtime location sharing via Firebase Realtime DB
   - `directionsService.js`: Route requests
   - `sosService.js`: SOS alert submission
   - `reportService.js`: Safety incident reporting
   - `safetyScore.js`: Client-side score calculation
 
-## Getting Started
+## ⚡How To Run This
 
 ### Local Development
 
 1. Backend
 
 ```powershell
-cd safejourney/backend
-python -m uvicorn main:app --reload
-# Runs on http://localhost:8001
+cd backend
+python -m venv .venv
+.\.venv\Scripts\activate
+pip install -r requirements.txt
+uvicorn main:app --reload
+# Runs on http://localhost:8000
 ```
 
 2. Frontend
 
 ```powershell
-cd safejourney/fend
+cd fend
 npm install
 npm run dev
-# Runs on http://localhost:5174
+# Runs on http://localhost:5173
 ```
 
-### Environment Configuration
+### 🔧 Environment Configuration
 
 **Backend (.env)**
 
@@ -128,25 +133,36 @@ TWILIO_PHONE_NUMBER=<your-twilio-number>
 **Frontend (.env)**
 
 ```
-VITE_API_BASE_URL=http://localhost:8001
+VITE_API_BASE_URL=http://localhost:8000
+VITE_FIREBASE_API_KEY=your_firebase_api_key_here
+VITE_FIREBASE_AUTH_DOMAIN=your-project-id.firebaseapp.com
+VITE_FIREBASE_PROJECT_ID=your-project-id
+VITE_FIREBASE_STORAGE_BUCKET=your-project-id.firebasestorage.app
+VITE_FIREBASE_MESSAGING_SENDER_ID=your_messaging_sender_id
+VITE_FIREBASE_APP_ID=your_app_id
+VITE_FIREBASE_DATABASE_URL=https://your-project-id-default-rtdb.firebaseio.com
 ```
 
 ### Firebase Setup
 
-- Configure Firebase project credentials in `safejourney/fend/src/config/firebase.js`
-- Enable Authentication (Email/Password) and Realtime Database
+- Configure frontend env values in `fend/.env` (do not commit real credentials)
+- Keep placeholders only in `fend/.env.example`
+- Enable Authentication (Email/Password), Firestore, and Realtime Database
+- Restart Vite after env changes
 
-## Project Structure
+## 📂 File Architecture
 
 ```
-safejourney/
+SafePath/
 ├─ backend/          # FastAPI server
+│  ├─ .env.example
 │  ├─ main.py
 │  ├─ models.py
 │  ├─ database.py
 │  ├─ requirements.txt
 │  └─ app/utils/     # Core services
 ├─ fend/             # React frontend
+│  ├─ .env.example
 │  ├─ src/
 │  │  ├─ components/
 │  │  ├─ utils/
@@ -157,23 +173,38 @@ safejourney/
 └─ README.md
 ```
 
-## API Endpoints
+## 🛣️ API Endpoints
 
 **Routes & Search**
 
 - `POST /api/routes` - Get multiple route options with safety scores
-- `POST /api/search` - Search locations by address
+- `GET /api/search` - Search locations by address
+- `GET /route` - Fetch route geometry proxy
 
 **Users**
 
-- `POST /users/` - Create user profile
+- `POST /users/` - Create or update user profile
+- `GET /api/users` - Get all users
 - `GET /api/users/{uid}` - Get user details
+- `POST /api/update-location` - Update user location
+- `GET /api/user-location/{uid}` - Get user location
+- `POST /api/update-emergency-contact` - Update emergency contact
+- `GET /api/check-emergency-contact` - Check emergency contact status
+
+**Safety**
+
+- `POST /api/reports` - Submit safety report
+- `GET /api/active-users` - Get active users near location
+- `POST /api/seed-segments` - Seed map segments
+- `GET /api/segments/{segment_id}/reports` - Get segment reports
+- `GET /api/segments/by-location` - Get segment by coordinates
 
 **SOS System**
 
-- `POST /sos/trigger` - Trigger SOS alert
-- `POST /sos/respond` - Respond to SOS alert
-- `GET /sos/nearby` - Get nearby SOS alerts
+- `POST /api/sos/alert` - Trigger SOS alert
+- `POST /api/sos/respond` - Respond to SOS alert
+- `POST /api/sos/resolve` - Resolve SOS alert
+- `GET /api/sos/active` - Get active SOS alerts
 
 **Health**
 
