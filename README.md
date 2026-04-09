@@ -11,7 +11,7 @@ SafePath addresses safety concerns during travel through:
 - **Route Safety Scoring**: Analyzes geographic segments for safety hazards based on community reports, generating real-time danger scores for alternative routes
 - **Safety Data**: Crowdsourced incident reports (harassment, theft, danger areas) mapped to geographic zones
 - **SOS Alerts**: Emergency dispatch system that notifies nearby users in the same zone to provide immediate peer assistance
-- **User Profiles**: Profile management with emergency contacts and credit-based helper incentives for SOS responses
+- **Account Page**: Dedicated profile page for updating travel preferences and emergency contact details from the map experience
 - **SMS Integration**: Twilio-powered SMS notifications for emergency alerts and critical updates
 
 ## ⚙️ Tech Stack
@@ -85,7 +85,8 @@ SafePath addresses safety concerns during travel through:
 **Frontend**
 
 - `src/App.jsx`: Main app routing
-- `src/components/`: UI components (Auth, Journey Planner, Map, SOS, etc.)
+- `src/components/`: UI components (Auth, Journey Planner, Account Page, Map, SOS, etc.)
+- `src/components/AccountPage.jsx`: Responsive profile management for preferences and emergency contact
 - `src/config/firebase.js`: Firebase initialization via Vite env vars
 - `src/utils/`:
   - `firebaseAuth.js`: Register/login/logout flows
