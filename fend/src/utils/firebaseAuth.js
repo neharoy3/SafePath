@@ -1,6 +1,9 @@
 import {
   createUserWithEmailAndPassword,
+  GoogleAuthProvider,
   deleteUser,
+  linkWithCredential,
+  signInWithPopup,
   signInWithEmailAndPassword,
   signOut,
   onAuthStateChanged,
@@ -10,6 +13,49 @@ import { auth } from "./../config/firebase";
 import { doc, setDoc, getDoc, updateDoc, deleteDoc } from "firebase/firestore";
 import { db } from "./../config/firebase";
 import { API_BASE_URL } from "./../config/api";
+
+const googleProvider = new GoogleAuthProvider();
+googleProvider.setCustomParameters({ prompt: "select_account" });
+
+const PENDING_GOOGLE_LINK_KEY = "pendingGoogleLinkCredential";
+
+const savePendingGoogleCredential = (credential) => {
+  if (!credential) return;
+
+  const pendingCredential = {
+    providerId: credential.providerId || "google.com",
+    signInMethod: credential.signInMethod || "google.com",
+    accessToken: credential.accessToken || null,
+    idToken: credential.idToken || null,
+  };
+
+  sessionStorage.setItem(
+    PENDING_GOOGLE_LINK_KEY,
+    JSON.stringify(pendingCredential),
+  );
+};
+
+const getPendingGoogleCredential = () => {
+  try {
+    const stored = sessionStorage.getItem(PENDING_GOOGLE_LINK_KEY);
+    if (!stored) return null;
+
+    const parsed = JSON.parse(stored);
+    if (!parsed?.accessToken && !parsed?.idToken) return null;
+
+    return GoogleAuthProvider.credential(
+      parsed.idToken || null,
+      parsed.accessToken || null,
+    );
+  } catch (error) {
+    console.warn("Could not read pending Google credential:", error);
+    return null;
+  }
+};
+
+const clearPendingGoogleCredential = () => {
+  sessionStorage.removeItem(PENDING_GOOGLE_LINK_KEY);
+};
 
 // ─── Sync user to backend (best-effort, never blocks auth) ───────────────────
 const syncUserToBackend = async (userPayload) => {
@@ -37,6 +83,102 @@ const fetchUserFromBackend = async (uid) => {
     console.warn("Error fetching user from backend:", error);
     return null;
   }
+};
+
+const buildUserProfileData = (firebaseUser, profileData = {}) => ({
+  uid: firebaseUser.uid,
+  fullName:
+    profileData.fullName ||
+    profileData.display_name ||
+    firebaseUser.displayName ||
+    firebaseUser.email?.split("@")[0] ||
+    "User",
+  email: profileData.email || firebaseUser.email || "",
+  phone: profileData.phone ?? null,
+  credits: profileData.credits ?? 250000,
+  latitude: profileData.latitude ?? null,
+  longitude: profileData.longitude ?? null,
+  emergencyContactNumber: profileData.emergencyContactNumber ?? null,
+});
+
+const syncFirebaseUserProfile = async (firebaseUser, overrides = {}) => {
+  const userDocRef = doc(db, "users", firebaseUser.uid);
+  const userDocSnap = await getDoc(userDocRef);
+
+  if (userDocSnap.exists()) {
+    try {
+      await updateDoc(userDocRef, { lastActiveAt: new Date().toISOString() });
+    } catch (error) {
+      console.warn("Could not update lastActiveAt:", error);
+    }
+
+    const firestoreData = userDocSnap.data();
+
+    await syncUserToBackend({
+      uid: firebaseUser.uid,
+      email: firestoreData.email || firebaseUser.email,
+      display_name: firestoreData.fullName || firebaseUser.displayName,
+      phone: firestoreData.phone || null,
+      photo_url: firebaseUser.photoURL || null,
+    });
+
+    return buildUserProfileData(firebaseUser, firestoreData);
+  }
+
+  const backendUser = await fetchUserFromBackend(firebaseUser.uid);
+
+  if (backendUser) {
+    await syncUserToBackend({
+      uid: firebaseUser.uid,
+      email: backendUser.email || firebaseUser.email,
+      display_name: backendUser.display_name || firebaseUser.displayName,
+      phone: backendUser.phone || null,
+      photo_url: firebaseUser.photoURL || null,
+    });
+
+    return buildUserProfileData(firebaseUser, backendUser);
+  }
+
+  const profile = {
+    id: `${new Date().getFullYear()}-${Math.floor(1000 + Math.random() * 9000)}_${firebaseUser.uid}`,
+    fullName:
+      overrides.fullName ||
+      firebaseUser.displayName ||
+      firebaseUser.email?.split("@")[0] ||
+      "User",
+    email: overrides.email || firebaseUser.email || "",
+    phone: overrides.phone ?? null,
+    credits: 250000,
+    createdAt: new Date().toISOString(),
+    lastActiveAt: new Date().toISOString(),
+    latitude: null,
+    longitude: null,
+    emergencyContactNumber: null,
+  };
+
+  await setDoc(userDocRef, profile);
+
+  const backendSaved = await syncUserToBackend({
+    uid: firebaseUser.uid,
+    email: profile.email,
+    display_name: profile.fullName,
+    phone: profile.phone,
+    photo_url: firebaseUser.photoURL || null,
+  });
+
+  if (!backendSaved) {
+    try {
+      await deleteDoc(userDocRef);
+    } catch (cleanupError) {
+      console.warn(
+        "Could not remove Firestore profile after backend sync failure:",
+        cleanupError,
+      );
+    }
+    throw new Error("Could not save the account profile.");
+  }
+
+  return buildUserProfileData(firebaseUser, profile);
 };
 
 /**
@@ -168,6 +310,60 @@ export const registerUser = async (userData) => {
   }
 };
 
+export const signInWithGoogle = async () => {
+  try {
+    const result = await signInWithPopup(auth, googleProvider);
+    const user = result.user;
+
+    const userData = await syncFirebaseUserProfile(user, {
+      fullName: user.displayName,
+      email: user.email,
+    });
+
+    clearPendingGoogleCredential();
+
+    return { success: true, user: userData };
+  } catch (error) {
+    console.error("signInWithGoogle error:", error?.code, error?.message);
+
+    if (error.code === "auth/account-exists-with-different-credential") {
+      savePendingGoogleCredential(error.credential);
+      return {
+        success: false,
+        message:
+          "This email already uses another sign-in method. Log in with your password first, then Google will be linked.",
+        needsLinking: true,
+        email: error.customData?.email || error.email || null,
+      };
+    }
+
+    if (error.code === "auth/popup-closed-by-user") {
+      return { success: false, message: "Google sign-in was canceled." };
+    }
+
+    if (error.code === "auth/operation-not-allowed") {
+      return {
+        success: false,
+        message: "Google sign-in is not enabled in your Firebase project.",
+      };
+    }
+
+    try {
+      await signOut(auth);
+    } catch (signOutError) {
+      console.warn(
+        "Could not sign out after failed Google sign-in:",
+        signOutError,
+      );
+    }
+
+    return {
+      success: false,
+      message: error.message || "Google sign-in failed.",
+    };
+  }
+};
+
 /**
  * Login user.
  * Backend sync is best-effort — login succeeds even if backend is unreachable.
@@ -181,7 +377,6 @@ export const loginUser = async (email, password) => {
       return { success: false, message: "Email and password are required" };
     }
 
-    // Firebase Auth sign in
     const userCredential = await signInWithEmailAndPassword(
       auth,
       normalizedEmail,
@@ -189,81 +384,17 @@ export const loginUser = async (email, password) => {
     );
     const user = userCredential.user;
 
-    // Try to get profile from Firestore first
-    const userDocRef = doc(db, "users", user.uid);
-    const userDocSnap = await getDoc(userDocRef);
-
-    let userData = null;
-
-    if (userDocSnap.exists()) {
-      // Update last active timestamp (non-blocking)
+    const pendingGoogleCredential = getPendingGoogleCredential();
+    if (pendingGoogleCredential) {
       try {
-        await updateDoc(userDocRef, { lastActiveAt: new Date().toISOString() });
-      } catch (e) {
-        console.warn("Could not update lastActiveAt:", e);
+        await linkWithCredential(user, pendingGoogleCredential);
+      } catch (linkError) {
+        console.warn("Could not link Google account:", linkError);
       }
-
-      // Sync to backend (best-effort)
-      await syncUserToBackend({
-        uid: user.uid,
-        email: user.email,
-        display_name: userDocSnap.data().fullName,
-        phone: userDocSnap.data().phone,
-        photo_url: user.photoURL,
-      });
-
-      userData = {
-        uid: user.uid,
-        fullName: userDocSnap.data().fullName,
-        email: userDocSnap.data().email,
-        phone: userDocSnap.data().phone,
-        credits: userDocSnap.data().credits ?? 250000,
-        latitude: userDocSnap.data().latitude ?? null,
-        longitude: userDocSnap.data().longitude ?? null,
-        emergencyContactNumber:
-          userDocSnap.data().emergencyContactNumber ?? null,
-      };
-    } else {
-      // No Firestore profile — try backend
-      const backendUser = await fetchUserFromBackend(user.uid);
-
-      if (backendUser) {
-        // Sync to backend to ensure it's fresh
-        await syncUserToBackend({
-          uid: user.uid,
-          email: user.email,
-          display_name: backendUser.display_name,
-          phone: backendUser.phone,
-          photo_url: user.photoURL,
-        });
-
-        userData = {
-          uid: user.uid,
-          fullName: backendUser.display_name || user.displayName || user.email,
-          email: backendUser.email || user.email,
-          phone: backendUser.phone || null,
-          credits: backendUser.credits ?? 250000,
-          latitude: backendUser.latitude ?? null,
-          longitude: backendUser.longitude ?? null,
-          emergencyContactNumber: backendUser.emergencyContactNumber ?? null,
-        };
-      } else {
-        try {
-          await signOut(auth);
-        } catch (signOutError) {
-          console.warn(
-            "Could not sign out unregistered user after failed login:",
-            signOutError,
-          );
-        }
-
-        return {
-          success: false,
-          message: "Account not registered. Please register first.",
-        };
-      }
+      clearPendingGoogleCredential();
     }
 
+    const userData = await syncFirebaseUserProfile(user);
     return { success: true, user: userData };
   } catch (error) {
     console.error("loginUser error:", error?.code, error?.message);
@@ -296,6 +427,7 @@ export const loginUser = async (email, password) => {
  */
 export const logoutUser = async () => {
   try {
+    clearPendingGoogleCredential();
     await signOut(auth);
     return { success: true };
   } catch (error) {
@@ -317,63 +449,11 @@ export const getCurrentUser = async () => {
       }
 
       try {
-        const userDocSnap = await getDoc(doc(db, "users", firebaseUser.uid));
-
-        if (userDocSnap.exists()) {
-          resolve({
-            uid: firebaseUser.uid,
-            fullName: userDocSnap.data().fullName,
-            email: userDocSnap.data().email,
-            phone: userDocSnap.data().phone,
-            credits: userDocSnap.data().credits ?? 250000,
-            latitude: userDocSnap.data().latitude ?? null,
-            longitude: userDocSnap.data().longitude ?? null,
-            emergencyContactNumber:
-              userDocSnap.data().emergencyContactNumber ?? null,
-          });
-        } else {
-          // Firestore profile missing — try backend
-          const backendUser = await fetchUserFromBackend(firebaseUser.uid);
-          if (backendUser) {
-            resolve({
-              uid: firebaseUser.uid,
-              fullName:
-                backendUser.display_name ||
-                firebaseUser.displayName ||
-                firebaseUser.email,
-              email: backendUser.email || firebaseUser.email,
-              phone: backendUser.phone || null,
-              credits: backendUser.credits ?? 250000,
-              latitude: backendUser.latitude ?? null,
-              longitude: backendUser.longitude ?? null,
-              emergencyContactNumber:
-                backendUser.emergencyContactNumber ?? null,
-            });
-          } else {
-            resolve(null);
-          }
-        }
+        const userData = await syncFirebaseUserProfile(firebaseUser);
+        resolve(userData);
       } catch (error) {
         console.error("Error fetching user data from Firestore:", error);
-        // Fallback to backend only
-        const backendUser = await fetchUserFromBackend(firebaseUser.uid);
-        if (backendUser) {
-          resolve({
-            uid: firebaseUser.uid,
-            fullName:
-              backendUser.display_name ||
-              firebaseUser.displayName ||
-              firebaseUser.email,
-            email: backendUser.email || firebaseUser.email,
-            phone: backendUser.phone || null,
-            credits: backendUser.credits ?? 250000,
-            latitude: backendUser.latitude ?? null,
-            longitude: backendUser.longitude ?? null,
-            emergencyContactNumber: backendUser.emergencyContactNumber ?? null,
-          });
-        } else {
-          resolve(null);
-        }
+        resolve(null);
       }
     });
   });
