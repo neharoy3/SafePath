@@ -198,20 +198,7 @@ def update_user_location(location_data: LocationUpdate):
         user = session.exec(statement).first()
         
         if not user:
-            print(f"⚠️ User {uid} not found, creating new user record...")
-            user = User(
-                uid=uid,
-                email=f"user_{uid}@temp.com",  # Temporary email
-                display_name=f"User {uid[:8]}",
-                latitude=lat,
-                longitude=lng,
-                credits=250000,
-                last_active_at=datetime.utcnow()
-            )
-            session.add(user)
-            session.commit()
-            session.refresh(user)
-            print(f"✅ Created new user: {user.uid}")
+            raise HTTPException(status_code=404, detail="User not found. Please register first.")
         
         old_segment = None
         if user.latitude and user.longitude:
@@ -317,19 +304,10 @@ def update_emergency_contact(data: EmergencyContactUpdate, session: Session = De
         user = session.exec(statement).first()
         
         if not user:
-            # Create user if doesn't exist
-            user = User(
-                uid=data.uid,
-                email=f"user_{data.uid}@temp.com",
-                display_name=f"User {data.uid[:8]}",
-                emergency_contact_number=phone,
-                credits=250000,
-                last_active_at=datetime.utcnow()
-            )
-            session.add(user)
-        else:
-            user.emergency_contact_number = phone
-        
+            raise HTTPException(status_code=404, detail="User not found. Please register first.")
+
+        user.emergency_contact_number = phone
+        session.add(user)
         session.commit()
         session.refresh(user)
         

@@ -1,26 +1,30 @@
 import {
   createUserWithEmailAndPassword,
+  deleteUser,
   signInWithEmailAndPassword,
   signOut,
   onAuthStateChanged,
   updateProfile
 } from 'firebase/auth'
 import { auth } from './../config/firebase'
-import { doc, setDoc, getDoc, updateDoc } from 'firebase/firestore'
+import { doc, setDoc, getDoc, updateDoc, deleteDoc } from 'firebase/firestore'
 import { db } from './../config/firebase'
 import { API_BASE_URL } from './../config/api'
 
 // ─── Sync user to backend (best-effort, never blocks auth) ───────────────────
 const syncUserToBackend = async (userPayload) => {
   try {
-    await fetch(`${API_BASE_URL}/users/`, {
+    const response = await fetch(`${API_BASE_URL}/users/`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(userPayload)
     })
+
+    return response.ok
   } catch (error) {
     // Backend sync is best-effort — don't crash auth if backend is down
     console.warn('Backend sync failed (non-fatal):', error)
+    return false
   }
 }
 
@@ -86,7 +90,7 @@ export const registerUser = async (userData) => {
     }
 
     // Sync to backend (best-effort — never blocks)
-    await syncUserToBackend({
+    const backendSaved = await syncUserToBackend({
       uid: user.uid,
       email: normalizedEmail,
       display_name: normalizedName,
@@ -94,8 +98,23 @@ export const registerUser = async (userData) => {
       photo_url: user.photoURL
     })
 
-    if (!firestoreSaved) {
-      console.warn('User registered without Firestore profile — backend fallback will be used.')
+    if (!firestoreSaved && !backendSaved) {
+      try {
+        await deleteDoc(doc(db, 'users', user.uid))
+      } catch (cleanupError) {
+        console.warn('Could not remove partial Firestore profile after failed registration:', cleanupError)
+      }
+
+      try {
+        await deleteUser(user)
+      } catch (cleanupError) {
+        console.warn('Could not remove Firebase Auth user after failed registration:', cleanupError)
+      }
+
+      return {
+        success: false,
+        message: 'Registration failed. Could not save the account profile.'
+      }
     }
 
     return {
@@ -207,49 +226,13 @@ export const loginUser = async (email, password) => {
           emergencyContactNumber: backendUser.emergencyContactNumber ?? null
         }
       } else {
-        // Last resort: use Firebase Auth data directly
-        // This handles the case where someone registered but Firestore/backend
-        // didn't save the profile properly
-        console.warn(`No Firestore/backend profile for ${user.uid} — using Firebase Auth data only`)
-
-        // Try to create a minimal Firestore record so next login works
         try {
-          const minimalDoc = {
-            id: user.uid,
-            fullName: user.displayName || user.email.split('@')[0],
-            email: user.email,
-            phone: '',
-            credits: 250000,
-            createdAt: new Date().toISOString(),
-            lastActiveAt: new Date().toISOString()
-          }
-          await setDoc(doc(db, 'users', user.uid), minimalDoc)
-          console.info('Created minimal Firestore profile for existing auth user')
-
-          userData = {
-            uid: user.uid,
-            fullName: minimalDoc.fullName,
-            email: minimalDoc.email,
-            phone: minimalDoc.phone,
-            credits: 250000,
-            latitude: null,
-            longitude: null,
-            emergencyContactNumber: null
-          }
-        } catch (createError) {
-          console.warn('Could not create minimal profile:', createError)
-          // Still let them log in with bare minimum
-          userData = {
-            uid: user.uid,
-            fullName: user.displayName || user.email.split('@')[0],
-            email: user.email,
-            phone: null,
-            credits: 250000,
-            latitude: null,
-            longitude: null,
-            emergencyContactNumber: null
-          }
+          await signOut(auth)
+        } catch (signOutError) {
+          console.warn('Could not sign out unregistered user after failed login:', signOutError)
         }
+
+        return { success: false, message: 'Account not registered. Please register first.' }
       }
     }
 
@@ -334,22 +317,12 @@ export const getCurrentUser = async () => {
               emergencyContactNumber: backendUser.emergencyContactNumber ?? null
             })
           } else {
-            // Absolute fallback
-            resolve({
-              uid: firebaseUser.uid,
-              fullName: firebaseUser.displayName || firebaseUser.email?.split('@')[0] || 'User',
-              email: firebaseUser.email || '',
-              phone: null,
-              credits: 250000,
-              latitude: null,
-              longitude: null,
-              emergencyContactNumber: null
-            })
+              resolve(null)
           }
         }
       } catch (error) {
         console.error('Error fetching user data from Firestore:', error)
-        // Fallback to Firebase Auth data
+          // Fallback to backend only
         const backendUser = await fetchUserFromBackend(firebaseUser.uid)
         if (backendUser) {
           resolve({
@@ -363,16 +336,7 @@ export const getCurrentUser = async () => {
             emergencyContactNumber: backendUser.emergencyContactNumber ?? null
           })
         } else {
-          resolve({
-            uid: firebaseUser.uid,
-            fullName: firebaseUser.displayName || firebaseUser.email?.split('@')[0] || 'User',
-            email: firebaseUser.email || '',
-            phone: null,
-            credits: 250000,
-            latitude: null,
-            longitude: null,
-            emergencyContactNumber: null
-          })
+          resolve(null)
         }
       }
     })
