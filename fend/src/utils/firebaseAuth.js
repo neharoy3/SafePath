@@ -115,6 +115,11 @@ const buildUserProfileData = (firebaseUser, profileData = {}) => ({
   latitude: profileData.latitude ?? null,
   longitude: profileData.longitude ?? null,
   emergencyContactNumber: profileData.emergencyContactNumber ?? null,
+  emergencyContacts: Array.isArray(profileData.emergencyContacts)
+    ? profileData.emergencyContacts
+    : profileData.emergencyContactNumber
+      ? [profileData.emergencyContactNumber]
+      : [],
   preferences: normalizePreferences(profileData.preferences),
 });
 
@@ -171,6 +176,7 @@ const syncFirebaseUserProfile = async (firebaseUser, overrides = {}) => {
     latitude: null,
     longitude: null,
     emergencyContactNumber: null,
+    emergencyContacts: [],
     preferences: normalizePreferences(),
   };
 
@@ -505,8 +511,23 @@ export const updateUserPreferences = async (userId, updates = {}) => {
       payload.preferences = normalizePreferences(updates.preferences);
     }
 
+    if (typeof updates.fullName !== "undefined") {
+      payload.fullName = (updates.fullName || "").trim();
+    }
+
     if (typeof updates.emergencyContactNumber !== "undefined") {
       payload.emergencyContactNumber = updates.emergencyContactNumber || null;
+    }
+
+    if (Array.isArray(updates.emergencyContacts)) {
+      const cleanedContacts = updates.emergencyContacts
+        .map((contact) => (contact || "").trim())
+        .filter(Boolean);
+      payload.emergencyContacts = cleanedContacts;
+
+      if (typeof updates.emergencyContactNumber === "undefined") {
+        payload.emergencyContactNumber = cleanedContacts[0] || null;
+      }
     }
 
     payload.lastActiveAt = new Date().toISOString();

@@ -27,15 +27,32 @@ const normalizePreferences = (preferences = {}) => ({
   },
 });
 
+const normalizeEmergencyContacts = (user = {}) => {
+  if (Array.isArray(user.emergencyContacts)) {
+    const filtered = user.emergencyContacts
+      .map((contact) => (contact || "").trim())
+      .filter(Boolean);
+    if (filtered.length > 0) return filtered;
+  }
+
+  if (user.emergencyContactNumber) {
+    return [user.emergencyContactNumber];
+  }
+
+  return [""];
+};
+
 const AccountPage = () => {
   const navigate = useNavigate();
   const auth = getAuth();
   const [profile, setProfile] = useState(null);
+  const [displayName, setDisplayName] = useState("");
   const [preferences, setPreferences] = useState(DEFAULT_PREFERENCES);
-  const [emergencyContact, setEmergencyContact] = useState("");
+  const [emergencyContacts, setEmergencyContacts] = useState([""]);
   const [loading, setLoading] = useState(true);
+  const [savingName, setSavingName] = useState(false);
   const [savingPreferences, setSavingPreferences] = useState(false);
-  const [savingContact, setSavingContact] = useState(false);
+  const [savingContacts, setSavingContacts] = useState(false);
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
 
@@ -55,8 +72,9 @@ const AccountPage = () => {
         }
 
         setProfile(currentUser);
+        setDisplayName(currentUser.fullName || "");
         setPreferences(normalizePreferences(currentUser.preferences));
-        setEmergencyContact(currentUser.emergencyContactNumber || "");
+        setEmergencyContacts(normalizeEmergencyContacts(currentUser));
 
         try {
           const response = await fetch(
@@ -65,7 +83,15 @@ const AccountPage = () => {
           if (response.ok) {
             const data = await response.json();
             if (data.has_emergency_contact && data.emergency_contact_number) {
-              setEmergencyContact(data.emergency_contact_number);
+              setEmergencyContacts((prevContacts) => {
+                const existing = prevContacts
+                  .map((contact) => (contact || "").trim())
+                  .filter(Boolean);
+                if (existing.length > 0) {
+                  return prevContacts;
+                }
+                return [data.emergency_contact_number];
+              });
             }
           }
         } catch (fetchError) {
@@ -107,6 +133,83 @@ const AccountPage = () => {
     }));
     setError("");
     setMessage("");
+  };
+
+  const handleEmergencyContactChange = (index, value) => {
+    setEmergencyContacts((prev) =>
+      prev.map((contact, itemIndex) => (itemIndex === index ? value : contact)),
+    );
+    setError("");
+    setMessage("");
+  };
+
+  const addEmergencyContactField = () => {
+    setEmergencyContacts((prev) => [...prev, ""]);
+    setError("");
+    setMessage("");
+  };
+
+  const removeEmergencyContactField = (index) => {
+    setEmergencyContacts((prev) => {
+      const next = prev.filter((_, itemIndex) => itemIndex !== index);
+      return next.length > 0 ? next : [""];
+    });
+    setError("");
+    setMessage("");
+  };
+
+  const handleSaveName = async () => {
+    setError("");
+    setMessage("");
+
+    if (!profile?.uid) {
+      setError("Please sign in again to update your name.");
+      return;
+    }
+
+    const trimmedName = displayName.trim();
+    if (!trimmedName) {
+      setError("Please enter your name before saving.");
+      return;
+    }
+
+    setSavingName(true);
+    try {
+      const result = await updateUserPreferences(profile.uid, {
+        fullName: trimmedName,
+      });
+
+      if (!result.success) {
+        throw new Error(result.message || "Unable to save your name");
+      }
+
+      setProfile((prev) => (prev ? { ...prev, fullName: trimmedName } : prev));
+
+      try {
+        await fetch(`${API_BASE_URL}/users/`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            uid: profile.uid,
+            email: profile.email,
+            display_name: trimmedName,
+            phone: profile.phone || null,
+          }),
+        });
+      } catch (backendSyncError) {
+        console.warn(
+          "Unable to sync updated name to backend:",
+          backendSyncError,
+        );
+      }
+
+      setMessage("Name updated successfully.");
+    } catch (saveError) {
+      console.error("Error saving name:", saveError);
+      setError(saveError.message || "Unable to save your name.");
+    } finally {
+      setSavingName(false);
+    }
   };
 
   const handleSavePreferences = async () => {
@@ -161,25 +264,35 @@ const AccountPage = () => {
     }
   };
 
-  const handleSaveEmergencyContact = async () => {
+  const handleSaveEmergencyContacts = async () => {
     setError("");
     setMessage("");
 
     if (!profile?.uid) {
-      setError("Please sign in again to update your emergency contact.");
+      setError("Please sign in again to update emergency contacts.");
       return;
     }
 
-    const phone = emergencyContact.trim();
-    const phoneDigits = phone.replace(/\D/g, "");
-    if (!phone || phoneDigits.length < 10) {
-      setError(
-        "Please enter a valid emergency contact number with at least 10 digits.",
-      );
+    const cleanedContacts = emergencyContacts
+      .map((contact) => (contact || "").trim())
+      .filter(Boolean);
+
+    if (cleanedContacts.length === 0) {
+      setError("Please add at least one emergency contact number.");
       return;
     }
 
-    setSavingContact(true);
+    const invalidContact = cleanedContacts.find(
+      (contact) => contact.replace(/\D/g, "").length < 10,
+    );
+    if (invalidContact) {
+      setError("Each emergency contact must have at least 10 digits.");
+      return;
+    }
+
+    const primaryContact = cleanedContacts[0];
+
+    setSavingContacts(true);
     try {
       const authUser = auth.currentUser;
       const token = authUser ? await authUser.getIdToken() : null;
@@ -194,7 +307,7 @@ const AccountPage = () => {
           },
           body: JSON.stringify({
             uid: profile.uid,
-            emergency_contact_number: phone,
+            emergency_contact_number: primaryContact,
           }),
         },
       );
@@ -205,7 +318,8 @@ const AccountPage = () => {
       }
 
       const firestoreResult = await updateUserPreferences(profile.uid, {
-        emergencyContactNumber: phone,
+        emergencyContactNumber: primaryContact,
+        emergencyContacts: cleanedContacts,
       });
 
       if (!firestoreResult.success) {
@@ -216,14 +330,21 @@ const AccountPage = () => {
       }
 
       setProfile((prev) =>
-        prev ? { ...prev, emergencyContactNumber: phone } : prev,
+        prev
+          ? {
+              ...prev,
+              emergencyContactNumber: primaryContact,
+              emergencyContacts: cleanedContacts,
+            }
+          : prev,
       );
-      setMessage("Emergency contact saved successfully.");
+      setEmergencyContacts(cleanedContacts);
+      setMessage("Emergency contacts saved successfully.");
     } catch (saveError) {
-      console.error("Error saving emergency contact:", saveError);
-      setError(saveError.message || "Unable to save emergency contact.");
+      console.error("Error saving emergency contacts:", saveError);
+      setError(saveError.message || "Unable to save emergency contacts.");
     } finally {
-      setSavingContact(false);
+      setSavingContacts(false);
     }
   };
 
@@ -278,239 +399,262 @@ const AccountPage = () => {
           </div>
         )}
 
-        <div className="grid gap-6 lg:grid-cols-[1.05fr_0.95fr]">
-          <section className="rounded-[28px] border border-white/10 bg-white/5 p-6 shadow-2xl backdrop-blur-xl sm:p-8">
-            <div className="flex flex-col gap-5 sm:flex-row sm:items-center">
-              <div className="flex h-20 w-20 items-center justify-center rounded-3xl bg-gradient-to-br from-cyan-400 to-blue-600 text-2xl font-bold text-white shadow-lg shadow-cyan-500/20">
-                {profile?.fullName
-                  ? profile.fullName
-                      .split(" ")
-                      .map((namePart) => namePart[0])
-                      .join("")
-                      .slice(0, 2)
-                      .toUpperCase()
-                  : "U"}
-              </div>
-              <div className="min-w-0 flex-1">
-                <h2 className="truncate text-2xl font-semibold text-white">
-                  {profile?.fullName || "User"}
-                </h2>
-                <p className="mt-1 break-all text-sm text-slate-400">
-                  {profile?.email || "No email available"}
-                </p>
-                <div className="mt-4 flex flex-wrap gap-3 text-sm text-slate-300">
-                  <span className="rounded-full border border-white/10 bg-slate-900/60 px-3 py-1">
-                    Credits: {profile?.credits ?? 250000}
-                  </span>
-                  <span className="rounded-full border border-white/10 bg-slate-900/60 px-3 py-1">
-                    Emergency contact:{" "}
-                    {profile?.emergencyContactNumber || "Not set"}
-                  </span>
-                </div>
-              </div>
-            </div>
-
-            <div className="mt-8 grid gap-4 sm:grid-cols-2">
-              <div className="rounded-2xl border border-white/10 bg-slate-950/50 p-4">
-                <p className="text-xs uppercase tracking-[0.25em] text-slate-400">
-                  Profile status
-                </p>
-                <p className="mt-2 text-base font-semibold text-white">
-                  {preferences.gender &&
-                  preferences.ageGroup &&
-                  preferences.transportMode
-                    ? "Preferences saved"
-                    : "Preferences incomplete"}
-                </p>
-                <p className="mt-1 text-sm text-slate-400">
-                  Keep these updated for a more personalized safety experience.
-                </p>
-              </div>
-              <div className="rounded-2xl border border-white/10 bg-slate-950/50 p-4">
-                <p className="text-xs uppercase tracking-[0.25em] text-slate-400">
-                  Emergency contact
-                </p>
-                <p className="mt-2 text-base font-semibold text-white">
-                  {emergencyContact || "No contact saved"}
-                </p>
-                <p className="mt-1 text-sm text-slate-400">
-                  SOS alerts will be routed to this number.
-                </p>
-              </div>
-            </div>
-
-            <div className="mt-8 rounded-2xl border border-cyan-400/20 bg-cyan-400/10 p-4 text-sm text-cyan-100">
-              Use the right-hand panels to edit your details. Each section saves
-              independently, so you can update only what changed.
-            </div>
-          </section>
-
+        <div className="grid gap-6 lg:grid-cols-[0.95fr_1.05fr]">
           <div className="space-y-6">
             <section className="rounded-[28px] border border-white/10 bg-white/5 p-6 shadow-2xl backdrop-blur-xl sm:p-8">
-              <div className="mb-6 flex items-start justify-between gap-4">
-                <div>
-                  <p className="text-sm uppercase tracking-[0.25em] text-cyan-300/80">
-                    Preferences
+              <div className="flex flex-col gap-5 sm:flex-row sm:items-center">
+                <div className="flex h-20 w-20 items-center justify-center rounded-3xl bg-gradient-to-br from-cyan-400 to-blue-600 text-2xl font-bold text-white shadow-lg shadow-cyan-500/20">
+                  {displayName
+                    ? displayName
+                        .split(" ")
+                        .map((namePart) => namePart[0])
+                        .join("")
+                        .slice(0, 2)
+                        .toUpperCase()
+                    : "U"}
+                </div>
+                <div className="min-w-0 flex-1">
+                  <h2 className="truncate text-2xl font-semibold text-white">
+                    {displayName || "User"}
+                  </h2>
+                  <p className="mt-1 break-all text-sm text-slate-400">
+                    {profile?.email || "No email available"}
                   </p>
-                  <h3 className="mt-1 text-xl font-semibold text-white">
-                    Travel profile
-                  </h3>
-                </div>
-                <span className="rounded-full border border-white/10 bg-slate-900/60 px-3 py-1 text-xs text-slate-300">
-                  Saved in account
-                </span>
-              </div>
-
-              <div className="space-y-5">
-                <div>
-                  <label className="mb-2 block text-sm font-medium text-slate-300">
-                    Gender
-                  </label>
-                  <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
-                    {["Male", "Female", "Other"].map((option) => (
-                      <button
-                        key={option}
-                        type="button"
-                        onClick={() => handlePreferenceChange("gender", option)}
-                        className={`rounded-xl border px-4 py-3 text-sm font-medium transition ${
-                          preferences.gender === option
-                            ? "border-cyan-400 bg-cyan-400/15 text-cyan-100"
-                            : "border-white/10 bg-slate-950/50 text-slate-300 hover:border-cyan-300/40 hover:bg-white/5"
-                        }`}
-                      >
-                        {option}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-
-                <div>
-                  <label className="mb-2 block text-sm font-medium text-slate-300">
-                    Age group
-                  </label>
-                  <select
-                    value={preferences.ageGroup}
-                    onChange={(event) =>
-                      handlePreferenceChange("ageGroup", event.target.value)
-                    }
-                    className="w-full rounded-xl border border-white/10 bg-slate-950/60 px-4 py-3 text-white outline-none transition focus:border-cyan-400 focus:ring-2 focus:ring-cyan-400/20"
-                  >
-                    <option value="">Select your age group</option>
-                    <option value="13-17">13 - 17</option>
-                    <option value="18-25">18 - 25</option>
-                    <option value="26-35">26 - 35</option>
-                    <option value="36-45">36 - 45</option>
-                    <option value="46-55">46 - 55</option>
-                    <option value="56+">56+</option>
-                  </select>
-                </div>
-
-                <div>
-                  <label className="mb-2 block text-sm font-medium text-slate-300">
-                    Transport mode
-                  </label>
-                  <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                    {["Walking", "Transport"].map((option) => (
-                      <button
-                        key={option}
-                        type="button"
-                        onClick={() =>
-                          handlePreferenceChange("transportMode", option)
-                        }
-                        className={`rounded-xl border px-4 py-3 text-sm font-medium transition ${
-                          preferences.transportMode === option
-                            ? "border-cyan-400 bg-cyan-400/15 text-cyan-100"
-                            : "border-white/10 bg-slate-950/50 text-slate-300 hover:border-cyan-300/40 hover:bg-white/5"
-                        }`}
-                      >
-                        {option}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-
-                <div>
-                  <div className="mb-2 flex items-center justify-between gap-3">
-                    <label className="block text-sm font-medium text-slate-300">
-                      Travel times
-                    </label>
-                    <span className="text-xs text-slate-500">
-                      Choose all that apply
-                    </span>
-                  </div>
-                  <div className="space-y-3 rounded-2xl border border-white/10 bg-slate-950/40 p-4">
-                    {[
-                      { id: "morning", label: "Morning (6 AM - 12 PM)" },
-                      { id: "afternoon", label: "Afternoon (12 PM - 6 PM)" },
-                      { id: "evening", label: "Evening (6 PM - 9 PM)" },
-                      { id: "night", label: "Night (9 PM - 6 AM)" },
-                    ].map((time) => (
-                      <label
-                        key={time.id}
-                        className="flex cursor-pointer items-center gap-3 text-sm text-slate-200"
-                      >
-                        <input
-                          type="checkbox"
-                          checked={preferences.transportTimes[time.id]}
-                          onChange={() => handleTimeToggle(time.id)}
-                          className="h-5 w-5 rounded border-slate-600 bg-slate-900 text-cyan-500 focus:ring-cyan-400"
-                        />
-                        <span>{time.label}</span>
-                      </label>
-                    ))}
-                  </div>
+                  <p className="mt-3 text-sm text-slate-300">
+                    Primary SOS number: {emergencyContacts[0] || "Not set"}
+                  </p>
                 </div>
               </div>
-
-              <button
-                type="button"
-                onClick={handleSavePreferences}
-                disabled={savingPreferences}
-                className="mt-6 inline-flex w-full items-center justify-center rounded-xl bg-gradient-to-r from-cyan-500 to-blue-600 px-4 py-3 text-sm font-semibold text-white transition hover:from-cyan-400 hover:to-blue-500 disabled:cursor-not-allowed disabled:opacity-70"
-              >
-                {savingPreferences
-                  ? "Saving preferences..."
-                  : "Save preferences"}
-              </button>
             </section>
 
             <section className="rounded-[28px] border border-white/10 bg-white/5 p-6 shadow-2xl backdrop-blur-xl sm:p-8">
               <div className="mb-6">
                 <p className="text-sm uppercase tracking-[0.25em] text-cyan-300/80">
-                  Emergency contact
+                  Profile
                 </p>
                 <h3 className="mt-1 text-xl font-semibold text-white">
-                  SOS destination number
+                  Edit name
                 </h3>
-                <p className="mt-2 text-sm text-slate-400">
-                  This number receives alerts when you use SOS.
-                </p>
               </div>
 
               <label className="mb-2 block text-sm font-medium text-slate-300">
-                Phone number
+                Full name
               </label>
               <input
-                type="tel"
-                value={emergencyContact}
-                onChange={(event) => setEmergencyContact(event.target.value)}
-                placeholder="Enter a phone number with country code"
+                type="text"
+                value={displayName}
+                onChange={(event) => setDisplayName(event.target.value)}
+                placeholder="Enter your full name"
                 className="w-full rounded-xl border border-white/10 bg-slate-950/60 px-4 py-3 text-white placeholder:text-slate-500 outline-none transition focus:border-cyan-400 focus:ring-2 focus:ring-cyan-400/20"
               />
-              <p className="mt-2 text-xs text-slate-500">
-                Use a reachable number with at least 10 digits.
-              </p>
 
               <button
                 type="button"
-                onClick={handleSaveEmergencyContact}
-                disabled={savingContact}
+                onClick={handleSaveName}
+                disabled={savingName}
                 className="mt-6 inline-flex w-full items-center justify-center rounded-xl border border-white/10 bg-white/5 px-4 py-3 text-sm font-semibold text-white transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-70"
               >
-                {savingContact ? "Saving contact..." : "Save emergency contact"}
+                {savingName ? "Saving name..." : "Save name"}
+              </button>
+            </section>
+
+            <section className="rounded-[28px] border border-white/10 bg-white/5 p-6 shadow-2xl backdrop-blur-xl sm:p-8">
+              <div className="mb-6 flex items-center justify-between gap-4">
+                <div>
+                  <p className="text-sm uppercase tracking-[0.25em] text-cyan-300/80">
+                    Emergency contacts
+                  </p>
+                  <h3 className="mt-1 text-xl font-semibold text-white">
+                    SOS destination numbers
+                  </h3>
+                  <p className="mt-2 text-sm text-slate-400">
+                    Add one or more numbers. The first number is used as primary
+                    backend contact.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={addEmergencyContactField}
+                  className="inline-flex h-10 w-10 items-center justify-center rounded-full border border-cyan-300/40 bg-cyan-400/10 text-xl text-cyan-200 transition hover:bg-cyan-400/20"
+                  aria-label="Add emergency contact"
+                  title="Add emergency contact"
+                >
+                  +
+                </button>
+              </div>
+
+              <div className="space-y-3">
+                {emergencyContacts.map((contact, index) => (
+                  <div key={`emergency-contact-${index}`}>
+                    <label className="mb-2 block text-sm font-medium text-slate-300">
+                      Contact {index + 1}
+                    </label>
+                    <div className="flex items-center gap-3">
+                      <input
+                        type="tel"
+                        value={contact}
+                        onChange={(event) =>
+                          handleEmergencyContactChange(
+                            index,
+                            event.target.value,
+                          )
+                        }
+                        placeholder="Enter phone number with country code"
+                        className="w-full rounded-xl border border-white/10 bg-slate-950/60 px-4 py-3 text-white placeholder:text-slate-500 outline-none transition focus:border-cyan-400 focus:ring-2 focus:ring-cyan-400/20"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => removeEmergencyContactField(index)}
+                        disabled={emergencyContacts.length === 1}
+                        className="inline-flex h-11 w-11 items-center justify-center rounded-xl border border-white/10 bg-slate-900/70 text-lg text-slate-200 transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50"
+                        aria-label={`Remove contact ${index + 1}`}
+                        title="Remove contact"
+                      >
+                        🗑
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              <button
+                type="button"
+                onClick={handleSaveEmergencyContacts}
+                disabled={savingContacts}
+                className="mt-6 inline-flex w-full items-center justify-center rounded-xl border border-white/10 bg-white/5 px-4 py-3 text-sm font-semibold text-white transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-70"
+              >
+                {savingContacts
+                  ? "Saving emergency contacts..."
+                  : "Save emergency contacts"}
               </button>
             </section>
           </div>
+
+          <section className="rounded-[28px] border border-white/10 bg-white/5 p-6 shadow-2xl backdrop-blur-xl sm:p-8">
+            <div className="mb-6 flex items-start justify-between gap-4">
+              <div>
+                <p className="text-sm uppercase tracking-[0.25em] text-cyan-300/80">
+                  Preferences
+                </p>
+                <h3 className="mt-1 text-xl font-semibold text-white">
+                  Travel profile
+                </h3>
+              </div>
+              <span className="rounded-full border border-white/10 bg-slate-900/60 px-3 py-1 text-xs text-slate-300">
+                Saved in account
+              </span>
+            </div>
+
+            <div className="space-y-5">
+              <div>
+                <label className="mb-2 block text-sm font-medium text-slate-300">
+                  Gender
+                </label>
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+                  {["Male", "Female", "Other"].map((option) => (
+                    <button
+                      key={option}
+                      type="button"
+                      onClick={() => handlePreferenceChange("gender", option)}
+                      className={`rounded-xl border px-4 py-3 text-sm font-medium transition ${
+                        preferences.gender === option
+                          ? "border-cyan-400 bg-cyan-400/15 text-cyan-100"
+                          : "border-white/10 bg-slate-950/50 text-slate-300 hover:border-cyan-300/40 hover:bg-white/5"
+                      }`}
+                    >
+                      {option}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div>
+                <label className="mb-2 block text-sm font-medium text-slate-300">
+                  Age group
+                </label>
+                <select
+                  value={preferences.ageGroup}
+                  onChange={(event) =>
+                    handlePreferenceChange("ageGroup", event.target.value)
+                  }
+                  className="w-full rounded-xl border border-white/10 bg-slate-950/60 px-4 py-3 text-white outline-none transition focus:border-cyan-400 focus:ring-2 focus:ring-cyan-400/20"
+                >
+                  <option value="">Select your age group</option>
+                  <option value="13-17">13 - 17</option>
+                  <option value="18-25">18 - 25</option>
+                  <option value="26-35">26 - 35</option>
+                  <option value="36-45">36 - 45</option>
+                  <option value="46-55">46 - 55</option>
+                  <option value="56+">56+</option>
+                </select>
+              </div>
+
+              <div>
+                <label className="mb-2 block text-sm font-medium text-slate-300">
+                  Transport mode
+                </label>
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                  {["Walking", "Transport"].map((option) => (
+                    <button
+                      key={option}
+                      type="button"
+                      onClick={() =>
+                        handlePreferenceChange("transportMode", option)
+                      }
+                      className={`rounded-xl border px-4 py-3 text-sm font-medium transition ${
+                        preferences.transportMode === option
+                          ? "border-cyan-400 bg-cyan-400/15 text-cyan-100"
+                          : "border-white/10 bg-slate-950/50 text-slate-300 hover:border-cyan-300/40 hover:bg-white/5"
+                      }`}
+                    >
+                      {option}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div>
+                <div className="mb-2 flex items-center justify-between gap-3">
+                  <label className="block text-sm font-medium text-slate-300">
+                    Travel times
+                  </label>
+                  <span className="text-xs text-slate-500">
+                    Choose all that apply
+                  </span>
+                </div>
+                <div className="space-y-3 rounded-2xl border border-white/10 bg-slate-950/40 p-4">
+                  {[
+                    { id: "morning", label: "Morning (6 AM - 12 PM)" },
+                    { id: "afternoon", label: "Afternoon (12 PM - 6 PM)" },
+                    { id: "evening", label: "Evening (6 PM - 9 PM)" },
+                    { id: "night", label: "Night (9 PM - 6 AM)" },
+                  ].map((time) => (
+                    <label
+                      key={time.id}
+                      className="flex cursor-pointer items-center gap-3 text-sm text-slate-200"
+                    >
+                      <input
+                        type="checkbox"
+                        checked={preferences.transportTimes[time.id]}
+                        onChange={() => handleTimeToggle(time.id)}
+                        className="h-5 w-5 rounded border-slate-600 bg-slate-900 text-cyan-500 focus:ring-cyan-400"
+                      />
+                      <span>{time.label}</span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            <button
+              type="button"
+              onClick={handleSavePreferences}
+              disabled={savingPreferences}
+              className="mt-6 inline-flex w-full items-center justify-center rounded-xl bg-gradient-to-r from-cyan-500 to-blue-600 px-4 py-3 text-sm font-semibold text-white transition hover:from-cyan-400 hover:to-blue-500 disabled:cursor-not-allowed disabled:opacity-70"
+            >
+              {savingPreferences ? "Saving preferences..." : "Save preferences"}
+            </button>
+          </section>
         </div>
       </div>
     </div>
