@@ -540,11 +540,11 @@ const JourneyPlanner = () => {
       {/* Top Section - Sidebar and Map */}
       <div className="flex flex-1 flex-col overflow-hidden lg:flex-row">
         {/* Left Sidebar */}
-        <div className="flex max-h-[42vh] w-full flex-col overflow-y-auto border-b border-gray-800 bg-dark-surface lg:max-h-none lg:w-96 lg:border-b-0 lg:border-r">
-          {/* User Info Card */}
-          <div className="sticky top-0 z-10 border-b border-gray-800 bg-dark-surface p-6">
-            <div className="flex items-center space-x-4 mb-4">
-              <div className="w-16 h-16 rounded-full bg-gradient-to-br from-blue-500 to-blue-700 flex items-center justify-center text-white text-xl font-bold shadow-lg">
+        <div className="flex max-h-[42vh] w-full flex-col overflow-hidden border-b border-gray-800 bg-dark-surface lg:max-h-none lg:w-96 lg:border-b-0 lg:border-r">
+          {/* Static User Info Card */}
+          <div className="shrink-0 border-b border-gray-800 bg-dark-surface p-6">
+            <div className="mb-4 flex items-center space-x-4">
+              <div className="flex h-16 w-16 items-center justify-center rounded-full bg-gradient-to-br from-blue-500 to-blue-700 text-xl font-bold text-white shadow-lg">
                 {user ? getInitials(user.fullName) : "U"}
               </div>
               <div className="min-w-0 flex-1">
@@ -560,79 +560,16 @@ const JourneyPlanner = () => {
                     {user?.email || "N/A"}
                   </p>
                 </button>
-                <button
-                  type="button"
-                  onClick={() => navigate(ROUTES.ACCOUNT)}
-                  className="mt-3 inline-flex items-center rounded-full border border-cyan-500/30 bg-cyan-500/10 px-3 py-1 text-xs font-semibold text-cyan-300 transition hover:bg-cyan-500/20"
-                >
-                  Account settings
-                </button>
               </div>
             </div>
 
-            <div className="flex items-center justify-between mb-3 p-3 bg-dark-bg rounded-lg">
-              <span className="text-gray-400 text-sm">Credits</span>
-              <span className="text-neon-blue font-bold text-lg">
-                {user?.credits || 250000}
-              </span>
-            </div>
-
-            {/* Location Status */}
-            <div className="flex items-center space-x-2 mb-3 p-2 bg-green-500/10 rounded-lg border border-green-500/20">
-              <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse"></div>
-              <span className="text-green-400 text-sm font-medium">
-                {userLocation
-                  ? "✅ Location Active"
-                  : "⚠️ Location Unavailable"}
-              </span>
-            </div>
-
-            <div className="mb-3 p-3 bg-dark-bg rounded-lg border border-gray-700">
-              <div className="flex items-center justify-between mb-2">
-                <p className="text-gray-400 text-xs flex items-center">
-                  <span className="mr-2">🆘</span> Emergency contact
-                </p>
-                <button
-                  type="button"
-                  onClick={() => navigate(ROUTES.ACCOUNT)}
-                  className="text-xs font-medium text-cyan-300 hover:text-cyan-200"
-                >
-                  Update
-                </button>
-              </div>
-              <p className="text-sm text-gray-200">
-                {user?.emergencyContactNumber || "Not set yet"}
-              </p>
-              <p className="mt-1 text-xs text-gray-500">
-                Keep this current so SOS alerts reach the right number.
-              </p>
-            </div>
-
-            {/* Live Location Display */}
-            {userLocation && (
-              <div className="mb-3 p-3 bg-dark-bg rounded-lg border border-gray-700">
-                <div className="flex items-center justify-between mb-2">
-                  <p className="text-gray-400 text-xs flex items-center">
-                    <span className="mr-2">📍</span> Live Location
-                  </p>
-                  <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse"></div>
-                </div>
-                <div className="space-y-1">
-                  <div className="flex justify-between items-center">
-                    <span className="text-gray-500 text-xs">Latitude:</span>
-                    <span className="text-gray-300 font-mono text-xs">
-                      {userLocation.lat.toFixed(6)}
-                    </span>
-                  </div>
-                  <div className="flex justify-between items-center">
-                    <span className="text-gray-500 text-xs">Longitude:</span>
-                    <span className="text-gray-300 font-mono text-xs">
-                      {userLocation.lng.toFixed(6)}
-                    </span>
-                  </div>
-                </div>
-              </div>
-            )}
+            <button
+              type="button"
+              onClick={() => navigate(ROUTES.ACCOUNT)}
+              className="mb-4 inline-flex items-center rounded-full border border-cyan-500/30 bg-cyan-500/10 px-3 py-1 text-xs font-semibold text-cyan-300 transition hover:bg-cyan-500/20"
+            >
+              Account settings
+            </button>
 
             {/* Logout Button */}
             <button
@@ -662,12 +599,70 @@ const JourneyPlanner = () => {
               }}
               className="w-full py-2.5 bg-red-600 hover:bg-red-700 text-white font-semibold rounded-lg transition-all duration-200 shadow-lg hover:shadow-xl"
             >
-              🚪 Logout
+              Logout
             </button>
+
+            {/* Location Status */}
+            <div className="mt-3 flex items-center space-x-2 rounded-lg border border-green-500/20 bg-green-500/10 p-2">
+              <div className="h-2 w-2 rounded-full bg-green-500 animate-pulse"></div>
+              <span className="text-sm font-medium text-green-400">
+                {userLocation
+                  ? "✅ Location Active"
+                  : "⚠️ Location Unavailable"}
+              </span>
+            </div>
           </div>
 
-          {/* Journey Planner Form */}
-          <div className="flex-1 min-h-[58vh] overflow-y-auto p-4 sm:p-6 lg:min-h-0">
+          {/* Scrollable Journey Content */}
+          <div className="min-h-0 flex-1 overflow-y-auto p-4 sm:p-6 lg:min-h-0">
+            <div className="mb-3 rounded-lg border border-gray-700 bg-dark-bg p-3">
+              <div className="mb-2 flex items-center justify-between">
+                <p className="flex items-center text-xs text-gray-400">
+                  <span className="mr-2">🆘</span> Emergency contact
+                </p>
+                <button
+                  type="button"
+                  onClick={() => navigate(ROUTES.ACCOUNT)}
+                  className="text-xs font-medium text-cyan-300 hover:text-cyan-200"
+                >
+                  Update
+                </button>
+              </div>
+              <p className="text-sm text-gray-200">
+                {user?.emergencyContactNumber || "Not set yet"}
+              </p>
+              <p className="mt-1 text-xs text-gray-500">
+                Keep this current so SOS alerts reach the right number.
+              </p>
+            </div>
+
+            {/* Live Location Display */}
+            {userLocation && (
+              <div className="mb-3 rounded-lg border border-gray-700 bg-dark-bg p-3">
+                <div className="mb-2 flex items-center justify-between">
+                  <p className="flex items-center text-xs text-gray-400">
+                    <span className="mr-2">📍</span> Live Location
+                  </p>
+                  <div className="h-2 w-2 rounded-full bg-green-500 animate-pulse"></div>
+                </div>
+                <div className="space-y-1">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs text-gray-500">Latitude:</span>
+                    <span className="font-mono text-xs text-gray-300">
+                      {userLocation.lat.toFixed(6)}
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs text-gray-500">Longitude:</span>
+                    <span className="font-mono text-xs text-gray-300">
+                      {userLocation.lng.toFixed(6)}
+                    </span>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Journey Planner Form */}
             <h2 className="text-2xl font-bold text-white mb-6 flex items-center">
               <span className="mr-3">🗺️</span>
               Plan Your Journey
