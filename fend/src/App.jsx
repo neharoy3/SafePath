@@ -5,8 +5,6 @@ import {
   Navigate,
 } from "react-router-dom";
 import { useState, useEffect } from "react";
-import { onAuthStateChanged } from "firebase/auth";
-import { auth } from "./config/firebase";
 import { getCurrentUser } from "./utils/firebaseAuth";
 import { ROUTES } from "./utils/routes";
 import AuthPage from "./components/AuthPage";
@@ -19,19 +17,13 @@ function App() {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    // Listen to Firebase auth state changes
-    const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
-      if (firebaseUser) {
-        // Verify user data exists in Firestore
-        const user = await getCurrentUser();
-        setIsAuthenticated(!!user);
-      } else {
-        setIsAuthenticated(false);
-      }
+    const loadSession = async () => {
+      const user = await getCurrentUser();
+      setIsAuthenticated(!!user);
       setLoading(false);
-    });
+    };
 
-    return () => unsubscribe();
+    loadSession();
   }, []);
 
   if (loading) {

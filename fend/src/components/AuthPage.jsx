@@ -42,7 +42,33 @@ const AuthPage = ({ setIsAuthenticated }) => {
     { code: "+971", label: "UAE (+971)" },
   ];
 
-  const isTenDigitPhone = (value) => /^\d{10}$/.test((value || "").trim());
+  const getNationalPhoneBounds = (countryCode) => {
+    const countryDigits = (countryCode || "").replace(/\D/g, "").length;
+    const maxDigits = Math.max(1, 15 - countryDigits);
+    const minDigits = Math.max(1, 8 - countryDigits);
+    return { minDigits, maxDigits };
+  };
+
+  const sanitizeNationalPhone = (value, countryCode) => {
+    const digits = (value || "").replace(/\D/g, "");
+    const { maxDigits } = getNationalPhoneBounds(countryCode);
+    return digits.slice(0, maxDigits);
+  };
+
+  const isValidNationalPhone = (value, countryCode) => {
+    const digits = (value || "").replace(/\D/g, "");
+    const { minDigits, maxDigits } = getNationalPhoneBounds(countryCode);
+    return digits.length >= minDigits && digits.length <= maxDigits;
+  };
+
+  const getNationalPhoneLengthHint = (countryCode) => {
+    const { minDigits, maxDigits } = getNationalPhoneBounds(countryCode);
+    if (minDigits === maxDigits) {
+      return `${minDigits}`;
+    }
+    return `${minDigits}-${maxDigits}`;
+  };
+
   const buildE164Phone = (value) => {
     const digits = (value || "").replace(/\D/g, "");
     return digits ? `${phoneCountryCode}${digits}` : "";
@@ -64,7 +90,7 @@ const AuthPage = ({ setIsAuthenticated }) => {
   const handleChange = (e) => {
     const nextValue =
       e.target.name === "phone"
-        ? e.target.value.replace(/\D/g, "").slice(0, 10)
+        ? sanitizeNationalPhone(e.target.value, phoneCountryCode)
         : e.target.value;
 
     setFormData({
@@ -120,8 +146,10 @@ const AuthPage = ({ setIsAuthenticated }) => {
       return;
     }
 
-    if (hasPhone && !isTenDigitPhone(formData.phone)) {
-      setError("Phone number must be exactly 10 digits");
+    if (hasPhone && !isValidNationalPhone(formData.phone, phoneCountryCode)) {
+      setError(
+        `Phone number must be ${getNationalPhoneLengthHint(phoneCountryCode)} digits for the selected country code`,
+      );
       setLoading(false);
       return;
     }
@@ -294,8 +322,10 @@ const AuthPage = ({ setIsAuthenticated }) => {
     const loginPassword =
       loginMethod === "phone" ? loginPhonePassword : loginEmailPassword;
 
-    if (loginMethod === "phone" && !isTenDigitPhone(loginPhone)) {
-      setError("Enter a valid 10-digit phone number");
+    if (loginMethod === "phone" && !isValidNationalPhone(loginPhone, loginCountryCode)) {
+      setError(
+        `Enter a valid ${getNationalPhoneLengthHint(loginCountryCode)} digit phone number for the selected country code`,
+      );
       setLoading(false);
       return;
     }
@@ -626,7 +656,14 @@ const AuthPage = ({ setIsAuthenticated }) => {
                   <div className="grid grid-cols-[160px_1fr] gap-3">
                     <select
                       value={loginCountryCode}
-                      onChange={(e) => setLoginCountryCode(e.target.value)}
+                      onChange={(e) => {
+                        const nextCountryCode = e.target.value;
+                        setLoginCountryCode(nextCountryCode);
+                        setLoginPhone((currentPhone) =>
+                          sanitizeNationalPhone(currentPhone, nextCountryCode),
+                        );
+                        setError("");
+                      }}
                       className="rounded-xl border border-white/20 bg-white/10 px-3 py-3 text-sm text-white outline-none transition-all duration-200 hover:bg-white/15 focus:border-blue-500 focus:ring-2 focus:ring-blue-500"
                     >
                       {COUNTRY_CODES.map((country) => (
@@ -644,13 +681,16 @@ const AuthPage = ({ setIsAuthenticated }) => {
                       value={loginPhone}
                       onChange={(e) => {
                         setLoginPhone(
-                          e.target.value.replace(/\D/g, "").slice(0, 10),
+                          sanitizeNationalPhone(
+                            e.target.value,
+                            loginCountryCode,
+                          ),
                         );
                         setError("");
                       }}
                       inputMode="numeric"
                       className="w-full rounded-xl border border-white/20 bg-white/10 px-4 py-3 text-base text-white placeholder-gray-300 transition-all duration-200 hover:bg-white/15 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                      placeholder="10-digit phone number"
+                      placeholder="National phone number"
                       required={activeTab === "login"}
                     />
                   </div>
@@ -695,7 +735,18 @@ const AuthPage = ({ setIsAuthenticated }) => {
                   <div className="grid grid-cols-[160px_1fr] gap-3">
                     <select
                       value={phoneCountryCode}
-                      onChange={(e) => setPhoneCountryCode(e.target.value)}
+                      onChange={(e) => {
+                        const nextCountryCode = e.target.value;
+                        setPhoneCountryCode(nextCountryCode);
+                        setFormData((prev) => ({
+                          ...prev,
+                          phone: sanitizeNationalPhone(
+                            prev.phone,
+                            nextCountryCode,
+                          ),
+                        }));
+                        setError("");
+                      }}
                       className="rounded-xl border border-white/20 bg-white/10 px-3 py-3 text-sm text-white outline-none transition-all duration-200 hover:bg-white/15 focus:border-blue-500 focus:ring-2 focus:ring-blue-500"
                     >
                       {COUNTRY_CODES.map((country) => (
@@ -715,7 +766,7 @@ const AuthPage = ({ setIsAuthenticated }) => {
                       onChange={handleChange}
                       inputMode="numeric"
                       className="w-full rounded-xl border border-white/20 bg-white/10 px-4 py-3 text-base text-white placeholder-gray-300 transition-all duration-200 hover:bg-white/15 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                      placeholder="10-digit phone number"
+                      placeholder="National phone number"
                     />
                   </div>
                 </div>
@@ -742,7 +793,7 @@ const AuthPage = ({ setIsAuthenticated }) => {
                     <button
                       type="button"
                       onClick={() => setOtpChannel("phone")}
-                      disabled={!isTenDigitPhone(formData.phone)}
+                      disabled={!isValidNationalPhone(formData.phone, phoneCountryCode)}
                       className={`rounded-xl border px-4 py-2 text-sm font-medium transition-all ${
                         otpChannel === "phone"
                           ? "border-blue-500 bg-blue-600 text-white"

@@ -1,14 +1,11 @@
 import {
-  createUserWithEmailAndPassword,
   fetchSignInMethodsForEmail,
   GoogleAuthProvider,
-  deleteUser,
   linkWithCredential,
   signInWithPopup,
   signInWithEmailAndPassword,
   signOut,
   onAuthStateChanged,
-  updateProfile,
 } from "firebase/auth";
 import { auth } from "./../config/firebase";
 import { doc, setDoc, getDoc, updateDoc, deleteDoc } from "firebase/firestore";
@@ -19,6 +16,7 @@ const googleProvider = new GoogleAuthProvider();
 googleProvider.setCustomParameters({ prompt: "select_account" });
 
 const PENDING_GOOGLE_LINK_KEY = "pendingGoogleLinkCredential";
+const AUTH_SESSION_KEY = "safePathAuthSession";
 const DEFAULT_TRANSPORT_TIMES = {
   morning: false,
   afternoon: false,
@@ -98,6 +96,32 @@ const clearPendingGoogleCredential = () => {
   sessionStorage.removeItem(PENDING_GOOGLE_LINK_KEY);
 };
 
+const saveAuthSession = (sessionData) => {
+  try {
+    localStorage.setItem(AUTH_SESSION_KEY, JSON.stringify(sessionData));
+  } catch (error) {
+    console.warn("Could not save auth session:", error);
+  }
+};
+
+const readAuthSession = () => {
+  try {
+    const stored = localStorage.getItem(AUTH_SESSION_KEY);
+    return stored ? JSON.parse(stored) : null;
+  } catch (error) {
+    console.warn("Could not read auth session:", error);
+    return null;
+  }
+};
+
+const clearAuthSession = () => {
+  try {
+    localStorage.removeItem(AUTH_SESSION_KEY);
+  } catch (error) {
+    console.warn("Could not clear auth session:", error);
+  }
+};
+
 const isValidEmail = (email) => EMAIL_REGEX.test((email || "").trim());
 
 const normalizePhone = (phone) => (phone || "").trim().replace(/\s+/g, "");
@@ -134,6 +158,30 @@ const extractPhoneFromSyntheticEmail = (email) => {
 
   return `+${digits}`;
 };
+
+const buildBackendUserProfileData = (backendUser = {}) => ({
+  uid: backendUser.uid,
+  fullName:
+    backendUser.display_name ||
+    backendUser.full_name ||
+    backendUser.email?.split("@")[0] ||
+    "User",
+  email: backendUser.email || "",
+  phone: backendUser.phone || null,
+  credits: backendUser.credits ?? 250000,
+  latitude: backendUser.latitude ?? null,
+  longitude: backendUser.longitude ?? null,
+  emergencyContactNumber:
+    backendUser.emergencyContactNumber ??
+    backendUser.emergency_contact_number ??
+    null,
+  emergencyContacts: Array.isArray(backendUser.emergencyContacts)
+    ? backendUser.emergencyContacts
+    : backendUser.emergency_contact_number
+      ? [backendUser.emergency_contact_number]
+      : [],
+  preferences: normalizePreferences(backendUser.preferences || {}),
+});
 
 export const getUserDisplayIdentifier = (user = {}) => {
   const phone = normalizePhone(user.phone || "");
@@ -241,14 +289,31 @@ export const getVerificationStatus = async (uid) => {
       `${API_BASE_URL}/auth/verification-status/${uid}`,
     );
     if (!response.ok) {
-      return { success: false, is_verified: true };
+      return {
+        success: false,
+        is_verified: false,
+        is_legacy_user: false,
+        message: `Verification status check failed (${response.status}).`,
+      };
     }
 
     const data = await response.json();
-    return { success: true, ...data };
+    return {
+      success: true,
+      ...data,
+      // Fail closed if backend payload is missing or malformed.
+      is_verified: Boolean(data?.is_verified),
+      is_legacy_user: Boolean(data?.is_legacy_user),
+    };
   } catch (error) {
-    // Fail-open for network issues to avoid locking out valid users.
-    return { success: false, is_verified: true };
+    return {
+      success: false,
+      is_verified: false,
+      is_legacy_user: false,
+      message:
+        error?.message ||
+        "Could not verify account status. Please try again.",
+    };
   }
 };
 
@@ -308,6 +373,17 @@ export const checkRegistrationIdentifiers = async ({ email, phone }) => {
             exists: true,
             message:
               "An account with this phone number already exists. Please login.",
+          };
+        }
+
+        // Handle 409 Conflict: multiple legacy accounts match this phone
+        if (response.status === 409) {
+          const data = await response.json().catch(() => ({}));
+          return {
+            exists: true,
+            message:
+              data.detail ||
+              "This phone number matches multiple accounts. Please login with email instead.",
           };
         }
       } catch (error) {
@@ -563,86 +639,14 @@ export const registerUser = async (userData) => {
   }
 
   try {
-    // Firebase Auth registration
-    const userCredential = await createUserWithEmailAndPassword(
-      auth,
-      firebaseEmail,
-      password,
-    );
-    const user = userCredential.user;
-
-    // Update Firebase display name
-    await updateProfile(user, { displayName: normalizedName });
-
-    // Generate a simple user ID
-    const userId = `${new Date().getFullYear()}-${Math.floor(1000 + Math.random() * 9000)}_${user.uid}`;
-
-    // Save to Firestore
-    const userDoc = {
-      id: userId,
-      fullName: normalizedName,
-      email: hasEmail ? normalizedEmail : firebaseEmail,
-      phone: hasPhone ? normalizedPhone : null,
-      credits: 250000,
-      createdAt: new Date().toISOString(),
-      lastActiveAt: new Date().toISOString(),
-    };
-
-    let firestoreSaved = false;
-    try {
-      await setDoc(doc(db, "users", user.uid), userDoc);
-      firestoreSaved = true;
-    } catch (firestoreError) {
-      console.warn(
-        "Firestore profile save failed, continuing with backend fallback:",
-        firestoreError,
-      );
-    }
-
-    // Sync to backend (best-effort — never blocks)
-    const backendSaved = await syncUserToBackend({
-      uid: user.uid,
-      email: hasEmail ? normalizedEmail : firebaseEmail,
-      display_name: normalizedName,
-      phone: hasPhone ? normalizedPhone : null,
-      photo_url: user.photoURL,
-    });
-
-    if (!firestoreSaved && !backendSaved) {
-      try {
-        await deleteDoc(doc(db, "users", user.uid));
-      } catch (cleanupError) {
-        console.warn(
-          "Could not remove partial Firestore profile after failed registration:",
-          cleanupError,
-        );
-      }
-
-      try {
-        await deleteUser(user);
-      } catch (cleanupError) {
-        console.warn(
-          "Could not remove Firebase Auth user after failed registration:",
-          cleanupError,
-        );
-      }
-
-      return {
-        success: false,
-        message: "Registration failed. Could not save the account profile.",
-      };
-    }
-
     if (!skipOtp) {
+      const uid = verificationSourceUid || `pending_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
       const otpSendResult = await sendVerificationOtp({
-        uid: user.uid,
+        uid,
         channel: verificationChannel,
         email: hasEmail ? normalizedEmail : null,
         phone: hasPhone ? normalizedPhone : null,
       });
-
-      // Keep the session un-authenticated until OTP verification is complete.
-      await signOut(auth);
 
       if (!otpSendResult.success) {
         return {
@@ -657,12 +661,12 @@ export const registerUser = async (userData) => {
         success: true,
         requiresVerification: true,
         verification: {
-          uid: user.uid,
+          uid,
           channel: otpSendResult.channel,
           destination: otpSendResult.destination,
         },
         user: {
-          uid: user.uid,
+          uid,
           fullName: normalizedName,
           email: hasEmail ? normalizedEmail : null,
           phone: hasPhone ? normalizedPhone : null,
@@ -671,32 +675,64 @@ export const registerUser = async (userData) => {
       };
     }
 
-    if (verificationSourceUid) {
-      const transferResult = await transferVerificationStatus({
-        sourceUid: verificationSourceUid,
-        targetUid: user.uid,
-      });
+    const uid = verificationSourceUid || userData.uid || `user_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+    const backendEmail = hasEmail ? normalizedEmail : firebaseEmail;
 
-      if (!transferResult.success) {
-        return {
-          success: false,
-          message:
-            transferResult.message ||
-            "Account created but verification mapping failed",
-        };
-      }
+    const response = await fetch(`${API_BASE_URL}/users/`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        uid,
+        email: backendEmail,
+        display_name: normalizedName,
+        phone: hasPhone ? normalizedPhone : null,
+        photo_url: null,
+      }),
+    });
+
+    const responseData = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      return {
+        success: false,
+        message:
+          responseData.detail || "Registration failed. Could not save the account profile.",
+      };
+    }
+
+    const createdUser = responseData.user || responseData;
+    const storedUser = buildBackendUserProfileData({
+      ...createdUser,
+      uid,
+      email: backendEmail,
+      display_name: normalizedName,
+      phone: hasPhone ? normalizedPhone : null,
+      credits: 250000,
+    });
+
+    saveAuthSession({ uid, authType: "otp" });
+
+    try {
+      await setDoc(
+        doc(db, "users", uid),
+        {
+          id: createdUser.id || `${new Date().getFullYear()}-${Math.floor(1000 + Math.random() * 9000)}_${uid}`,
+          fullName: normalizedName,
+          email: backendEmail,
+          phone: hasPhone ? normalizedPhone : null,
+          credits: 250000,
+          createdAt: new Date().toISOString(),
+          lastActiveAt: new Date().toISOString(),
+        },
+        { merge: true },
+      );
+    } catch (firestoreError) {
+      console.warn("Could not mirror OTP registration to Firestore:", firestoreError);
     }
 
     return {
       success: true,
       requiresVerification: false,
-      user: {
-        uid: user.uid,
-        fullName: normalizedName,
-        email: hasEmail ? normalizedEmail : null,
-        phone: hasPhone ? normalizedPhone : null,
-        credits: 250000,
-      },
+      user: storedUser,
     };
   } catch (error) {
     console.error("registerUser error:", error?.code, error?.message);
@@ -909,6 +945,7 @@ export const loginUser = async (identifier, password) => {
 export const logoutUser = async () => {
   try {
     clearPendingGoogleCredential();
+    clearAuthSession();
     await signOut(auth);
     return { success: true };
   } catch (error) {
@@ -920,6 +957,14 @@ export const logoutUser = async () => {
  * Get current authenticated user with full profile
  */
 export const getCurrentUser = async () => {
+  const storedSession = readAuthSession();
+  if (storedSession?.uid) {
+    const backendUser = await fetchUserFromBackend(storedSession.uid);
+    if (backendUser) {
+      return buildBackendUserProfileData(backendUser);
+    }
+  }
+
   return new Promise((resolve) => {
     const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
       unsubscribe();

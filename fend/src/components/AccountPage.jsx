@@ -1,6 +1,5 @@
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { getAuth } from "firebase/auth";
 import { doc, setDoc } from "firebase/firestore";
 import {
   getCurrentUser,
@@ -75,7 +74,6 @@ const isSyntheticPhoneEmail = (value = "") =>
 
 const AccountPage = () => {
   const navigate = useNavigate();
-  const auth = getAuth();
   const [profile, setProfile] = useState(null);
   const [displayName, setDisplayName] = useState("");
   const [emailAddress, setEmailAddress] = useState("");
@@ -396,8 +394,6 @@ const AccountPage = () => {
         throw new Error(verifyResult.message || "Invalid OTP.");
       }
 
-      const authUser = auth.currentUser;
-
       await setDoc(
         doc(db, "users", profile.uid),
         {
@@ -407,22 +403,40 @@ const AccountPage = () => {
         { merge: true },
       );
 
-      await fetch(`${API_BASE_URL}/users/`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          uid: profile.uid,
-          email: normalizedEmail,
-          display_name: displayName || profile.fullName || "User",
-          phone: profile.phone || null,
-        }),
-      });
+      let backendSyncSucceeded = true;
+      try {
+        const response = await fetch(`${API_BASE_URL}/users/`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            uid: profile.uid,
+            email: normalizedEmail,
+            display_name: displayName || profile.fullName || "User",
+            phone: profile.phone || null,
+          }),
+        });
+
+        const backendData = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          backendSyncSucceeded = false;
+          throw new Error(
+            backendData.detail || "Could not sync email to backend.",
+          );
+        }
+      } catch (backendSyncError) {
+        backendSyncSucceeded = false;
+        console.warn("Email OTP verification succeeded, but backend sync failed:", backendSyncError);
+      }
 
       setProfile((prev) => (prev ? { ...prev, email: normalizedEmail } : prev));
       setEmailAddress(normalizedEmail);
       setEmailOtp("");
       setEmailOtpSentTo("");
-      setMessage("Email verified and saved successfully using OTP.");
+      setMessage(
+        backendSyncSucceeded
+          ? "Email verified and saved successfully using OTP."
+          : "Email verified successfully, but backend sync could not be completed.",
+      );
     } catch (verifyError) {
       setError(verifyError.message || "Could not verify email OTP.");
     } finally {
@@ -460,16 +474,12 @@ const AccountPage = () => {
 
     setSavingContacts(true);
     try {
-      const authUser = auth.currentUser;
-      const token = authUser ? await authUser.getIdToken() : null;
-
       const response = await fetch(
         `${API_BASE_URL}/api/update-emergency-contact`,
         {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
-            ...(token ? { Authorization: `Bearer ${token}` } : {}),
           },
           body: JSON.stringify({
             uid: profile.uid,

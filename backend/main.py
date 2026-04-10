@@ -124,13 +124,25 @@ EMAIL_PATTERN = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
 PHONE_PATTERN = re.compile(r"^\+[1-9]\d{7,14}$")
 OTP_TTL_MINUTES = int(os.getenv("OTP_TTL_MINUTES", "5"))
 OTP_RESEND_COOLDOWN_SECONDS = int(os.getenv("OTP_RESEND_COOLDOWN_SECONDS", "45"))
-OTP_SECRET = os.getenv("OTP_SECRET", "dev-only-otp-secret")
+OTP_SECRET = os.getenv("OTP_SECRET")
+ENVIRONMENT = os.getenv("ENVIRONMENT", "development").lower()
 SMTP_HOST = os.getenv("SMTP_HOST", "")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USERNAME = os.getenv("SMTP_USERNAME", "")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
 SMTP_FROM_EMAIL = os.getenv("SMTP_FROM_EMAIL", "")
 SMTP_USE_TLS = os.getenv("SMTP_USE_TLS", "true").lower() == "true"
+
+# Fail-fast: OTP_SECRET must be set in production
+if not OTP_SECRET and ENVIRONMENT != "development":
+    raise ValueError(
+        "OTP_SECRET environment variable must be set in non-development environments. "
+        "Set ENVIRONMENT='development' for local testing or provide a secure OTP_SECRET."
+    )
+
+# Use a dev-only secret only in development mode
+if not OTP_SECRET:
+    OTP_SECRET = "dev-only-otp-secret"
 
 
 def is_valid_email(value: str) -> bool:
@@ -175,22 +187,22 @@ def resolve_login_identifier(payload: ResolveIdentifierRequest, session: Session
         user = session.exec(select(User).where(User.phone == normalized_phone)).first()
         if not user:
             # Backward-compatible fallback for legacy phone storage (without country code / mixed formatting).
+            # Use SQL LIKE pattern instead of Python loop to avoid O(N) full table scan
             identifier_digits = "".join(ch for ch in normalized_phone if ch.isdigit())
             tail_digits = identifier_digits[-10:] if len(identifier_digits) >= 10 else identifier_digits
 
             if tail_digits:
-                candidates = session.exec(select(User).where(User.phone.is_not(None))).all()
-                matched_users = []
+                # Query users whose phone ends with tail_digits using LIKE pattern
+                # This is more efficient than loading all users and looping in Python
+                candidates = session.exec(
+                    select(User)
+                    .where(User.phone.is_not(None))
+                    .where(User.phone.like(f"%{tail_digits}"))
+                ).all()
 
-                for candidate in candidates:
-                    candidate_phone = (candidate.phone or "").strip()
-                    candidate_digits = "".join(ch for ch in candidate_phone if ch.isdigit())
-                    if candidate_digits and candidate_digits.endswith(tail_digits):
-                        matched_users.append(candidate)
-
-                if len(matched_users) == 1:
-                    user = matched_users[0]
-                elif len(matched_users) > 1:
+                if len(candidates) == 1:
+                    user = candidates[0]
+                elif len(candidates) > 1:
                     raise HTTPException(
                         status_code=409,
                         detail="Multiple accounts match this phone number. Please login with email.",
@@ -332,6 +344,22 @@ def send_verification_otp(payload: SendOTPRequest, session: Session = Depends(ge
             wait_for = int(OTP_RESEND_COOLDOWN_SECONDS - elapsed)
             raise HTTPException(status_code=429, detail=f"Please wait {wait_for}s before requesting another OTP")
 
+    # Rate limit by destination to prevent spamming via different UIDs
+    # Check if this email/phone has received OTPs recently from ANY UID
+    recent_destination_otp = session.exec(
+        select(OTPCode)
+        .where(OTPCode.destination == destination)
+        .where(OTPCode.channel == payload.channel)
+        .where(OTPCode.created_at > datetime.utcnow() - timedelta(minutes=1))
+        .order_by(OTPCode.created_at.desc())
+    ).first()
+
+    if recent_destination_otp:
+        raise HTTPException(
+            status_code=429,
+            detail="Too many OTP requests to this destination. Please try again later.",
+        )
+
     otp_code = generate_otp_code()
     otp_record = OTPCode(
         uid=payload.uid,
@@ -345,12 +373,20 @@ def send_verification_otp(payload: SendOTPRequest, session: Session = Depends(ge
     verification = get_or_create_verification(payload.uid, session)
     verification.updated_at = datetime.utcnow()
     session.add(verification)
-    session.commit()
 
-    if payload.channel == "email":
-        send_email_otp(destination, otp_code)
-    else:
-        send_sms_otp(destination, otp_code)
+    # Attempt to send OTP before committing to database
+    try:
+        if payload.channel == "email":
+            send_email_otp(destination, otp_code)
+        else:
+            send_sms_otp(destination, otp_code)
+    except Exception as send_error:
+        # Rollback on send failure to avoid stale OTP and cooldown lockout
+        session.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to send OTP: {str(send_error)}")
+
+    # Commit only after successful send
+    session.commit()
 
     return {
         "success": True,
@@ -487,16 +523,12 @@ def create_or_update_user(user_data: UserRequest, session: Session = Depends(get
     if not user_data.uid or not user_data.email:
         raise HTTPException(status_code=400, detail="uid and email are required")
 
+    # Only look up user by UID, never by email/phone for updates
+    # This prevents account takeover by claiming another user's email/phone
     user = session.exec(select(User).where(User.uid == user_data.uid)).first()
 
-    if not user:
-        user = session.exec(select(User).where(User.email == user_data.email)).first()
-
-    if not user and user_data.phone:
-        user = session.exec(select(User).where(User.phone == user_data.phone)).first()
-
     if user:
-        user.uid = user_data.uid
+        # Update existing user - but NEVER change uid
         user.email = user_data.email
         user.display_name = user_data.display_name
         user.phone = user_data.phone
@@ -533,27 +565,12 @@ def create_or_update_user(user_data: UserRequest, session: Session = Depends(get
         return {"status": "created", "user": new_user}
     except IntegrityError:
         session.rollback()
-        existing = session.exec(select(User).where(User.email == user_data.email)).first()
-        if not existing and user_data.phone:
-            existing = session.exec(select(User).where(User.phone == user_data.phone)).first()
-
-        if existing:
-            existing.uid = user_data.uid
-            existing.email = user_data.email
-            existing.display_name = user_data.display_name
-            existing.phone = user_data.phone
-            existing.photo_url = user_data.photo_url
-            existing.latitude = user_data.latitude
-            existing.longitude = user_data.longitude
-            existing.last_active_at = datetime.utcnow()
-            session.add(existing)
-            session.commit()
-            session.refresh(existing)
-            return {"status": "updated", "user": existing}
-
+        # Don't attempt email/phone lookup for UPDATE - this enables account takeover
+        # If creation failed due to duplicate email/phone, the account with that email/phone
+        # is owned by another uid. Return 409 and let client handle re-auth if needed.
         raise HTTPException(
             status_code=409,
-            detail="A user with this email or phone already exists.",
+            detail="A user with this email or phone already exists. Please login with your existing account instead.",
         )
 
 class RouteRequest(BaseModel):
@@ -1134,7 +1151,7 @@ async def get_routes(route_request: RouteRequest):
                         duration_penalty += max(0.0, 1 - norm_dist) * avoid_weight["longRoutes"]
 
                     if avoid_factors.get("heavyTraffic"):
-                        duration_penalty += max(0.0, 1 - min(1.0, route["duration"] / 45.0)) * avoid_weight["heavyTraffic"]
+                        duration_penalty += min(1.0, route["duration"] / 45.0) * avoid_weight["heavyTraffic"]
 
                     if avoid_factors.get("accidentProne"):
                         safety_penalty += max(0.0, (6.8 - route['safety']['safety_score']) / 10.0) * avoid_weight["accidentProne"]
@@ -1178,6 +1195,15 @@ async def get_routes(route_request: RouteRequest):
                     route['safety']['color'] = 'red'
                     route['safety']['rating'] = 'least safe'
                     route['name'] = f'Alternative Route (Red) - {route["distance"]} km, Safety: {route["safety"]["safety_score"]}/10'
+
+            selected_factors = [
+                avoid_labels[key]
+                for key, enabled in avoid_factors.items()
+                if enabled and key in avoid_labels
+            ]
+            if selected_factors:
+                for route in routes_with_safety[:3]:
+                    route['avoid_summary'] = selected_factors
             
             if len(routes_with_safety) > 0 and len(routes_with_safety) < 3:
                 base_route = routes_with_safety[0]
@@ -1237,22 +1263,6 @@ async def get_routes(route_request: RouteRequest):
                         route['safety']['color'] = 'red'
                         route['safety']['rating'] = 'least safe'
                         route['name'] = f'Alternative Route (Red) - {route["distance"]} km, Safety: {route["safety"]["safety_score"]}/10'
-
-                    selected_factors = [
-                        avoid_labels[key]
-                        for key, enabled in avoid_factors.items()
-                        if enabled and key in avoid_labels
-                    ]
-                    if selected_factors:
-                        route['avoid_summary'] = selected_factors
-
-                    selected_factors = [
-                        avoid_labels[key]
-                        for key, enabled in avoid_factors.items()
-                        if enabled and key in avoid_labels
-                    ]
-                    if selected_factors:
-                        route['avoid_summary'] = selected_factors
             
             return {
                 "routes": routes_with_safety[:3],  # Return exactly 3 routes
