@@ -122,7 +122,7 @@ class TransferVerificationRequest(BaseModel):
 
 EMAIL_PATTERN = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
 PHONE_PATTERN = re.compile(r"^\+[1-9]\d{7,14}$")
-OTP_TTL_MINUTES = int(os.getenv("OTP_TTL_MINUTES", "10"))
+OTP_TTL_MINUTES = int(os.getenv("OTP_TTL_MINUTES", "5"))
 OTP_RESEND_COOLDOWN_SECONDS = int(os.getenv("OTP_RESEND_COOLDOWN_SECONDS", "45"))
 OTP_SECRET = os.getenv("OTP_SECRET", "dev-only-otp-secret")
 SMTP_HOST = os.getenv("SMTP_HOST", "")
@@ -244,13 +244,31 @@ def send_email_otp(destination_email: str, otp_code: str):
         f"Your SafePath verification code is {otp_code}. It expires in {OTP_TTL_MINUTES} minutes."
     )
 
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as smtp:
-        if SMTP_USE_TLS:
-            context = ssl.create_default_context()
-            smtp.starttls(context=context)
-        if SMTP_USERNAME and SMTP_PASSWORD:
-            smtp.login(SMTP_USERNAME, SMTP_PASSWORD)
-        smtp.send_message(message)
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as smtp:
+            if SMTP_USE_TLS:
+                context = ssl.create_default_context()
+                smtp.starttls(context=context)
+            if SMTP_USERNAME and SMTP_PASSWORD:
+                smtp.login(SMTP_USERNAME, SMTP_PASSWORD)
+            smtp.send_message(message)
+    except smtplib.SMTPAuthenticationError:
+        raise HTTPException(
+            status_code=502,
+            detail="SMTP authentication failed. Check SMTP_USERNAME and SMTP_PASSWORD.",
+        )
+    except smtplib.SMTPSenderRefused:
+        raise HTTPException(
+            status_code=502,
+            detail="SMTP sender rejected. Verify SMTP_FROM_EMAIL in your email provider.",
+        )
+    except smtplib.SMTPRecipientsRefused:
+        raise HTTPException(status_code=400, detail="Recipient email address was rejected")
+    except smtplib.SMTPException as smtp_error:
+        raise HTTPException(
+            status_code=502,
+            detail=f"SMTP send failed: {str(smtp_error)}",
+        )
 
 
 def send_sms_otp(destination_phone: str, otp_code: str):
@@ -392,7 +410,14 @@ def verify_otp(payload: VerifyOTPRequest, session: Session = Depends(get_session
     session.add(verification)
     if user:
         session.add(user)
-    session.commit()
+
+    try:
+        session.commit()
+    except IntegrityError:
+        session.rollback()
+        if payload.channel == "email":
+            raise HTTPException(status_code=409, detail="This email is already linked to another account")
+        raise HTTPException(status_code=409, detail="This phone is already linked to another account")
 
     return {
         "success": True,

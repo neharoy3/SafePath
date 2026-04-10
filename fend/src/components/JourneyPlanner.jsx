@@ -18,7 +18,6 @@ import {
   watchDeviceLocation,
   getOptimalUpdateInterval,
 } from "../utils/deviceLocationService";
-import { getUserDisplayIdentifier } from "../utils/firebaseAuth";
 import MapContainer from "./MapContainer";
 import RouteCard from "./RouteCard";
 import NavigationPanel from "./NavigationPanel";
@@ -558,9 +557,6 @@ const JourneyPlanner = () => {
                   <h3 className="text-lg font-semibold text-white transition hover:text-cyan-300">
                     {user?.fullName || "User"}
                   </h3>
-                  <p className="text-sm text-gray-400">
-                    {getUserDisplayIdentifier(user)}
-                  </p>
                 </button>
               </div>
             </div>

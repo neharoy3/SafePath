@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { getAuth, updateEmail } from "firebase/auth";
+import { getAuth } from "firebase/auth";
 import { doc, setDoc } from "firebase/firestore";
 import {
   getCurrentUser,
@@ -397,9 +397,6 @@ const AccountPage = () => {
       }
 
       const authUser = auth.currentUser;
-      if (authUser && authUser.email !== normalizedEmail) {
-        await updateEmail(authUser, normalizedEmail);
-      }
 
       await setDoc(
         doc(db, "users", profile.uid),
@@ -416,8 +413,7 @@ const AccountPage = () => {
         body: JSON.stringify({
           uid: profile.uid,
           email: normalizedEmail,
-          display_name:
-            displayName || profile.fullName || authUser?.displayName || "User",
+          display_name: displayName || profile.fullName || "User",
           phone: profile.phone || null,
         }),
       });
@@ -426,7 +422,7 @@ const AccountPage = () => {
       setEmailAddress(normalizedEmail);
       setEmailOtp("");
       setEmailOtpSentTo("");
-      setMessage("Email verified and saved successfully.");
+      setMessage("Email verified and saved successfully using OTP.");
     } catch (verifyError) {
       setError(verifyError.message || "Could not verify email OTP.");
     } finally {

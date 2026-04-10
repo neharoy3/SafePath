@@ -209,16 +209,28 @@ export const verifyRegistrationOtp = async ({ uid, channel, otp }) => {
       body: JSON.stringify({ uid, channel, otp }),
     });
 
-    const data = await response.json();
+    const rawBody = await response.text();
+    let data = {};
+    try {
+      data = rawBody ? JSON.parse(rawBody) : {};
+    } catch {
+      data = { detail: rawBody || "Unknown server response" };
+    }
+
     if (!response.ok) {
-      return { success: false, message: data.detail || "Invalid OTP" };
+      const detail = data.detail || data.message || "Invalid OTP";
+      return {
+        success: false,
+        message: typeof detail === "string" ? detail : JSON.stringify(detail),
+        status: response.status,
+      };
     }
 
     return { success: true, ...data };
   } catch (error) {
     return {
       success: false,
-      message: "Could not verify OTP. Please try again.",
+      message: error?.message || "Could not verify OTP. Please try again.",
     };
   }
 };
