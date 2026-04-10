@@ -1,7 +1,12 @@
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { getAuth } from "firebase/auth";
-import { getCurrentUser, updateUserPreferences } from "../utils/firebaseAuth";
+import {
+  getCurrentUser,
+  updateUserPreferences,
+  sendVerificationOtp,
+  verifyRegistrationOtp,
+} from "../utils/firebaseAuth";
 import { API_BASE_URL } from "../config/api";
 import { ROUTES } from "../utils/routes";
 
@@ -42,6 +47,8 @@ const normalizeEmergencyContacts = (user = {}) => {
   return [""];
 };
 
+const E164_PHONE_REGEX = /^\+[1-9]\d{7,14}$/;
+
 const AccountPage = () => {
   const navigate = useNavigate();
   const auth = getAuth();
@@ -49,6 +56,11 @@ const AccountPage = () => {
   const [displayName, setDisplayName] = useState("");
   const [preferences, setPreferences] = useState(DEFAULT_PREFERENCES);
   const [emergencyContacts, setEmergencyContacts] = useState([""]);
+  const [phoneNumber, setPhoneNumber] = useState("");
+  const [phoneOtp, setPhoneOtp] = useState("");
+  const [phoneOtpSentTo, setPhoneOtpSentTo] = useState("");
+  const [sendingPhoneOtp, setSendingPhoneOtp] = useState(false);
+  const [verifyingPhoneOtp, setVerifyingPhoneOtp] = useState(false);
   const [loading, setLoading] = useState(true);
   const [savingName, setSavingName] = useState(false);
   const [savingPreferences, setSavingPreferences] = useState(false);
@@ -73,6 +85,7 @@ const AccountPage = () => {
 
         setProfile(currentUser);
         setDisplayName(currentUser.fullName || "");
+        setPhoneNumber(currentUser.phone || "");
         setPreferences(normalizePreferences(currentUser.preferences));
         setEmergencyContacts(normalizeEmergencyContacts(currentUser));
 
@@ -348,6 +361,100 @@ const AccountPage = () => {
     }
   };
 
+  const handleSendPhoneOtp = async () => {
+    setError("");
+    setMessage("");
+
+    if (!profile?.uid) {
+      setError("Please sign in again to update phone number.");
+      return;
+    }
+
+    const normalizedPhone = phoneNumber.trim().replace(/\s+/g, "");
+    if (!E164_PHONE_REGEX.test(normalizedPhone)) {
+      setError(
+        "Enter a valid phone in E.164 format (for example +14155552671).",
+      );
+      return;
+    }
+
+    setSendingPhoneOtp(true);
+    try {
+      const result = await sendVerificationOtp({
+        uid: profile.uid,
+        channel: "phone",
+        phone: normalizedPhone,
+      });
+
+      if (!result.success) {
+        throw new Error(result.message || "Could not send OTP to phone.");
+      }
+
+      setPhoneOtpSentTo(result.destination || "your phone");
+      setMessage("OTP sent to your phone. Enter it below to verify.");
+    } catch (sendError) {
+      setError(sendError.message || "Could not send OTP to phone.");
+    } finally {
+      setSendingPhoneOtp(false);
+    }
+  };
+
+  const handleVerifyPhoneOtp = async () => {
+    setError("");
+    setMessage("");
+
+    if (!profile?.uid) {
+      setError("Please sign in again to verify phone number.");
+      return;
+    }
+
+    if (!/^\d{6}$/.test(phoneOtp)) {
+      setError("Enter a valid 6-digit OTP.");
+      return;
+    }
+
+    setVerifyingPhoneOtp(true);
+    try {
+      const verifyResult = await verifyRegistrationOtp({
+        uid: profile.uid,
+        channel: "phone",
+        otp: phoneOtp,
+      });
+
+      if (!verifyResult.success) {
+        throw new Error(verifyResult.message || "Invalid OTP.");
+      }
+
+      const userResponse = await fetch(
+        `${API_BASE_URL}/api/users/${profile.uid}`,
+      );
+      const backendUser = userResponse.ok ? await userResponse.json() : null;
+      const verifiedPhone =
+        backendUser?.phone || phoneNumber.trim().replace(/\s+/g, "");
+
+      const firestoreResult = await updateUserPreferences(profile.uid, {
+        phone: verifiedPhone,
+      });
+
+      if (!firestoreResult.success) {
+        console.warn(
+          "Phone verified in backend, Firestore sync failed:",
+          firestoreResult.message,
+        );
+      }
+
+      setProfile((prev) => (prev ? { ...prev, phone: verifiedPhone } : prev));
+      setPhoneNumber(verifiedPhone);
+      setPhoneOtp("");
+      setPhoneOtpSentTo("");
+      setMessage("Phone number verified and saved successfully.");
+    } catch (verifyError) {
+      setError(verifyError.message || "Could not verify phone OTP.");
+    } finally {
+      setVerifyingPhoneOtp(false);
+    }
+  };
+
   if (loading) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-slate-950 text-white">
@@ -420,6 +527,9 @@ const AccountPage = () => {
                   <p className="mt-1 break-all text-sm text-slate-400">
                     {profile?.email || "No email available"}
                   </p>
+                  <p className="mt-1 break-all text-sm text-slate-400">
+                    {profile?.phone || "No verified phone"}
+                  </p>
                   <p className="mt-3 text-sm text-slate-300">
                     Primary SOS number: {emergencyContacts[0] || "Not set"}
                   </p>
@@ -455,6 +565,78 @@ const AccountPage = () => {
                 className="mt-6 inline-flex w-full items-center justify-center rounded-xl border border-white/10 bg-white/5 px-4 py-3 text-sm font-semibold text-white transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-70"
               >
                 {savingName ? "Saving name..." : "Save name"}
+              </button>
+            </section>
+
+            <section className="rounded-[28px] border border-white/10 bg-white/5 p-6 shadow-2xl backdrop-blur-xl sm:p-8">
+              <div className="mb-6">
+                <p className="text-sm uppercase tracking-[0.25em] text-cyan-300/80">
+                  Contact
+                </p>
+                <h3 className="mt-1 text-xl font-semibold text-white">
+                  Add or change phone
+                </h3>
+                <p className="mt-2 text-sm text-slate-400">
+                  Phone changes are saved only after OTP verification.
+                </p>
+              </div>
+
+              <label className="mb-2 block text-sm font-medium text-slate-300">
+                Phone number (E.164)
+              </label>
+              <input
+                type="tel"
+                value={phoneNumber}
+                onChange={(event) => {
+                  setPhoneNumber(event.target.value);
+                  setPhoneOtpSentTo("");
+                  setPhoneOtp("");
+                  setError("");
+                  setMessage("");
+                }}
+                placeholder="+14155552671"
+                className="w-full rounded-xl border border-white/10 bg-slate-950/60 px-4 py-3 text-white placeholder:text-slate-500 outline-none transition focus:border-cyan-400 focus:ring-2 focus:ring-cyan-400/20"
+              />
+
+              <button
+                type="button"
+                onClick={handleSendPhoneOtp}
+                disabled={sendingPhoneOtp}
+                className="mt-4 inline-flex w-full items-center justify-center rounded-xl border border-white/10 bg-white/5 px-4 py-3 text-sm font-semibold text-white transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-70"
+              >
+                {sendingPhoneOtp ? "Sending OTP..." : "Send OTP to phone"}
+              </button>
+
+              {phoneOtpSentTo && (
+                <div className="mt-4 rounded-xl border border-cyan-400/25 bg-cyan-500/10 p-3 text-sm text-cyan-100">
+                  OTP sent to {phoneOtpSentTo}
+                </div>
+              )}
+
+              <label className="mt-4 mb-2 block text-sm font-medium text-slate-300">
+                Enter OTP
+              </label>
+              <input
+                type="text"
+                inputMode="numeric"
+                maxLength={6}
+                value={phoneOtp}
+                onChange={(event) =>
+                  setPhoneOtp(event.target.value.replace(/\D/g, ""))
+                }
+                placeholder="123456"
+                className="w-full rounded-xl border border-white/10 bg-slate-950/60 px-4 py-3 text-white placeholder:text-slate-500 outline-none transition focus:border-cyan-400 focus:ring-2 focus:ring-cyan-400/20"
+              />
+
+              <button
+                type="button"
+                onClick={handleVerifyPhoneOtp}
+                disabled={verifyingPhoneOtp}
+                className="mt-4 inline-flex w-full items-center justify-center rounded-xl bg-gradient-to-r from-cyan-500 to-blue-600 px-4 py-3 text-sm font-semibold text-white transition hover:from-cyan-400 hover:to-blue-500 disabled:cursor-not-allowed disabled:opacity-70"
+              >
+                {verifyingPhoneOtp
+                  ? "Verifying OTP..."
+                  : "Verify and save phone"}
               </button>
             </section>
 

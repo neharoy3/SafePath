@@ -38,3 +38,29 @@ class Segment(SQLModel, table=True):
         """Check if a point (lat, lon) falls within this segment"""
         return (self.lat_min <= lat <= self.lat_max and 
                 self.lon_min <= lon <= self.lon_max)
+
+
+class UserVerification(SQLModel, table=True):
+    __tablename__ = "user_verifications"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    uid: str = Field(unique=True, index=True)
+    email_verified: bool = Field(default=False)
+    phone_verified: bool = Field(default=False)
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class OTPCode(SQLModel, table=True):
+    __tablename__ = "otp_codes"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    uid: str = Field(index=True)
+    channel: str = Field(index=True)
+    destination: str
+    otp_hash: str
+    expires_at: datetime
+    attempts: int = Field(default=0)
+    max_attempts: int = Field(default=5)
+    is_used: bool = Field(default=False)
+    created_at: datetime = Field(default_factory=datetime.utcnow)

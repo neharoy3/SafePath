@@ -1,11 +1,11 @@
 ﻿from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks
 from sqlmodel import select, Session, SQLModel
-from models import User, Segment
+from models import User, Segment, UserVerification, OTPCode
 from database import engine, get_session
 from datetime import datetime, timedelta
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Literal
 from app.utils.segment_utils import (
     get_segment_by_location, 
     update_segment_safety_score,
@@ -30,6 +30,13 @@ import copy
 import asyncio
 import os
 from twilio.rest import Client
+import hashlib
+import random
+import re
+import smtplib
+import ssl
+from email.message import EmailMessage
+from sqlalchemy.exc import IntegrityError
 
 app = FastAPI(title="SafePath Backend", version="4.0.0")
 
@@ -91,16 +98,380 @@ class UserRequest(BaseModel):
     longitude: Optional[float] = None
 
 
+class SendOTPRequest(BaseModel):
+    uid: str
+    channel: Literal["email", "phone"]
+    email: Optional[str] = None
+    phone: Optional[str] = None
+
+
+class VerifyOTPRequest(BaseModel):
+    uid: str
+    channel: Literal["email", "phone"]
+    otp: str
+
+
+class ResolveIdentifierRequest(BaseModel):
+    identifier: str
+
+
+class TransferVerificationRequest(BaseModel):
+    source_uid: str
+    target_uid: str
+
+
+EMAIL_PATTERN = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
+PHONE_PATTERN = re.compile(r"^\+[1-9]\d{7,14}$")
+OTP_TTL_MINUTES = int(os.getenv("OTP_TTL_MINUTES", "10"))
+OTP_RESEND_COOLDOWN_SECONDS = int(os.getenv("OTP_RESEND_COOLDOWN_SECONDS", "45"))
+OTP_SECRET = os.getenv("OTP_SECRET", "dev-only-otp-secret")
+SMTP_HOST = os.getenv("SMTP_HOST", "")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USERNAME = os.getenv("SMTP_USERNAME", "")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+SMTP_FROM_EMAIL = os.getenv("SMTP_FROM_EMAIL", "")
+SMTP_USE_TLS = os.getenv("SMTP_USE_TLS", "true").lower() == "true"
+
+
+def is_valid_email(value: str) -> bool:
+    return bool(value and EMAIL_PATTERN.match(value.strip()))
+
+
+def is_valid_phone(value: str) -> bool:
+    return bool(value and PHONE_PATTERN.match(value.strip()))
+
+
+def normalize_email(value: str) -> str:
+    return value.strip().lower()
+
+
+def normalize_phone(value: str) -> str:
+    return value.strip().replace(" ", "")
+
+
+def is_pending_uid(uid: str) -> bool:
+    return bool(uid and uid.startswith("pending_"))
+
+
+@app.post("/auth/resolve-identifier")
+def resolve_login_identifier(payload: ResolveIdentifierRequest, session: Session = Depends(get_session)):
+    raw_identifier = (payload.identifier or "").strip()
+    if not raw_identifier:
+        raise HTTPException(status_code=400, detail="Identifier is required")
+
+    normalized_email = normalize_email(raw_identifier)
+    if is_valid_email(normalized_email):
+        user = session.exec(select(User).where(User.email == normalized_email)).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        return {
+            "uid": user.uid,
+            "email": user.email,
+            "phone": user.phone,
+        }
+
+    normalized_phone = normalize_phone(raw_identifier)
+    if is_valid_phone(normalized_phone):
+        user = session.exec(select(User).where(User.phone == normalized_phone)).first()
+        if not user:
+            # Backward-compatible fallback for legacy phone storage (without country code / mixed formatting).
+            identifier_digits = "".join(ch for ch in normalized_phone if ch.isdigit())
+            tail_digits = identifier_digits[-10:] if len(identifier_digits) >= 10 else identifier_digits
+
+            if tail_digits:
+                candidates = session.exec(select(User).where(User.phone.is_not(None))).all()
+                matched_users = []
+
+                for candidate in candidates:
+                    candidate_phone = (candidate.phone or "").strip()
+                    candidate_digits = "".join(ch for ch in candidate_phone if ch.isdigit())
+                    if candidate_digits and candidate_digits.endswith(tail_digits):
+                        matched_users.append(candidate)
+
+                if len(matched_users) == 1:
+                    user = matched_users[0]
+                elif len(matched_users) > 1:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Multiple accounts match this phone number. Please login with email.",
+                    )
+
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        return {
+            "uid": user.uid,
+            "email": user.email,
+            "phone": user.phone,
+        }
+
+    raise HTTPException(status_code=400, detail="Enter a valid email or phone number")
+
+
+def generate_otp_code() -> str:
+    return f"{random.randint(100000, 999999)}"
+
+
+def hash_otp(uid: str, channel: str, otp: str) -> str:
+    payload = f"{uid}:{channel}:{otp}:{OTP_SECRET}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def mask_destination(channel: str, destination: str) -> str:
+    if channel == "email":
+        local, _, domain = destination.partition("@")
+        local_mask = (local[:1] + "***") if local else "***"
+        domain_mask = (domain[:1] + "***") if domain else "***"
+        return f"{local_mask}@{domain_mask}"
+
+    if len(destination) <= 5:
+        return "***"
+
+    return f"***{destination[-4:]}"
+
+
+def send_email_otp(destination_email: str, otp_code: str):
+    if not (SMTP_HOST and SMTP_FROM_EMAIL):
+        raise HTTPException(
+            status_code=503,
+            detail="Email OTP is not configured on server",
+        )
+
+    message = EmailMessage()
+    message["Subject"] = "SafePath verification code"
+    message["From"] = SMTP_FROM_EMAIL
+    message["To"] = destination_email
+    message.set_content(
+        f"Your SafePath verification code is {otp_code}. It expires in {OTP_TTL_MINUTES} minutes."
+    )
+
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as smtp:
+        if SMTP_USE_TLS:
+            context = ssl.create_default_context()
+            smtp.starttls(context=context)
+        if SMTP_USERNAME and SMTP_PASSWORD:
+            smtp.login(SMTP_USERNAME, SMTP_PASSWORD)
+        smtp.send_message(message)
+
+
+def send_sms_otp(destination_phone: str, otp_code: str):
+    if not twilio_client:
+        raise HTTPException(status_code=503, detail="SMS OTP is not configured on server")
+
+    twilio_client.messages.create(
+        body=f"Your SafePath verification code is {otp_code}. It expires in {OTP_TTL_MINUTES} minutes.",
+        from_=TWILIO_PHONE_NUMBER,
+        to=destination_phone,
+    )
+
+
+def get_or_create_verification(uid: str, session: Session) -> UserVerification:
+    verification = session.exec(select(UserVerification).where(UserVerification.uid == uid)).first()
+    if verification:
+        return verification
+
+    verification = UserVerification(uid=uid)
+    session.add(verification)
+    session.commit()
+    session.refresh(verification)
+    return verification
+
+
+@app.post("/auth/otp/send")
+def send_verification_otp(payload: SendOTPRequest, session: Session = Depends(get_session)):
+    if not payload.uid:
+        raise HTTPException(status_code=400, detail="uid is required")
+
+    statement = select(User).where(User.uid == payload.uid)
+    user = session.exec(statement).first()
+
+    if not user and not is_pending_uid(payload.uid):
+        raise HTTPException(status_code=404, detail="User not found")
+
+    destination = ""
+    if payload.channel == "email":
+        email_source = payload.email or (user.email if user else "")
+        email_value = normalize_email(email_source)
+        if not is_valid_email(email_value):
+            raise HTTPException(status_code=400, detail="Invalid email address")
+        destination = email_value
+    else:
+        phone_source = payload.phone or (user.phone if user else "")
+        phone_value = normalize_phone(phone_source)
+        if not is_valid_phone(phone_value):
+            raise HTTPException(status_code=400, detail="Invalid phone number. Use E.164 format like +14155552671")
+        destination = phone_value
+
+    last_otp = session.exec(
+        select(OTPCode)
+        .where(OTPCode.uid == payload.uid)
+        .where(OTPCode.channel == payload.channel)
+        .order_by(OTPCode.created_at.desc())
+    ).first()
+
+    if last_otp:
+        elapsed = (datetime.utcnow() - last_otp.created_at).total_seconds()
+        if elapsed < OTP_RESEND_COOLDOWN_SECONDS:
+            wait_for = int(OTP_RESEND_COOLDOWN_SECONDS - elapsed)
+            raise HTTPException(status_code=429, detail=f"Please wait {wait_for}s before requesting another OTP")
+
+    otp_code = generate_otp_code()
+    otp_record = OTPCode(
+        uid=payload.uid,
+        channel=payload.channel,
+        destination=destination,
+        otp_hash=hash_otp(payload.uid, payload.channel, otp_code),
+        expires_at=datetime.utcnow() + timedelta(minutes=OTP_TTL_MINUTES),
+    )
+
+    session.add(otp_record)
+    verification = get_or_create_verification(payload.uid, session)
+    verification.updated_at = datetime.utcnow()
+    session.add(verification)
+    session.commit()
+
+    if payload.channel == "email":
+        send_email_otp(destination, otp_code)
+    else:
+        send_sms_otp(destination, otp_code)
+
+    return {
+        "success": True,
+        "channel": payload.channel,
+        "destination": mask_destination(payload.channel, destination),
+        "expires_in_seconds": OTP_TTL_MINUTES * 60,
+    }
+
+
+@app.post("/auth/otp/verify")
+def verify_otp(payload: VerifyOTPRequest, session: Session = Depends(get_session)):
+    if not payload.otp or not payload.otp.isdigit() or len(payload.otp) != 6:
+        raise HTTPException(status_code=400, detail="OTP must be a 6-digit code")
+
+    otp_record = session.exec(
+        select(OTPCode)
+        .where(OTPCode.uid == payload.uid)
+        .where(OTPCode.channel == payload.channel)
+        .order_by(OTPCode.created_at.desc())
+    ).first()
+
+    if not otp_record:
+        raise HTTPException(status_code=404, detail="OTP not found. Request a new OTP")
+
+    if otp_record.is_used:
+        raise HTTPException(status_code=400, detail="OTP already used. Request a new OTP")
+
+    if datetime.utcnow() > otp_record.expires_at:
+        raise HTTPException(status_code=400, detail="OTP expired. Request a new OTP")
+
+    if otp_record.attempts >= otp_record.max_attempts:
+        raise HTTPException(status_code=429, detail="Too many invalid attempts. Request a new OTP")
+
+    submitted_hash = hash_otp(payload.uid, payload.channel, payload.otp)
+    if submitted_hash != otp_record.otp_hash:
+        otp_record.attempts += 1
+        session.add(otp_record)
+        session.commit()
+        raise HTTPException(status_code=400, detail="Invalid OTP")
+
+    otp_record.is_used = True
+    session.add(otp_record)
+
+    user = session.exec(select(User).where(User.uid == payload.uid)).first()
+
+    verification = get_or_create_verification(payload.uid, session)
+    if payload.channel == "email":
+        verification.email_verified = True
+        if user:
+            user.email = normalize_email(otp_record.destination)
+    else:
+        verification.phone_verified = True
+        if user:
+            user.phone = normalize_phone(otp_record.destination)
+    verification.updated_at = datetime.utcnow()
+
+    session.add(verification)
+    if user:
+        session.add(user)
+    session.commit()
+
+    return {
+        "success": True,
+        "email_verified": verification.email_verified,
+        "phone_verified": verification.phone_verified,
+        "is_verified": verification.email_verified or verification.phone_verified,
+    }
+
+
+@app.get("/auth/verification-status/{uid}")
+def get_verification_status(uid: str, session: Session = Depends(get_session)):
+    statement = select(UserVerification).where(UserVerification.uid == uid)
+    verification = session.exec(statement).first()
+
+    # Legacy users (before OTP rollout) remain valid.
+    if not verification:
+        return {
+            "uid": uid,
+            "email_verified": True,
+            "phone_verified": True,
+            "is_verified": True,
+            "is_legacy_user": True,
+        }
+
+    return {
+        "uid": uid,
+        "email_verified": verification.email_verified,
+        "phone_verified": verification.phone_verified,
+        "is_verified": verification.email_verified or verification.phone_verified,
+        "is_legacy_user": False,
+    }
+
+
+@app.post("/auth/verification/transfer")
+def transfer_verification_status(payload: TransferVerificationRequest, session: Session = Depends(get_session)):
+    if not payload.source_uid or not payload.target_uid:
+        raise HTTPException(status_code=400, detail="source_uid and target_uid are required")
+
+    source = session.exec(select(UserVerification).where(UserVerification.uid == payload.source_uid)).first()
+    if not source:
+        raise HTTPException(status_code=404, detail="Source verification not found")
+
+    target = session.exec(select(UserVerification).where(UserVerification.uid == payload.target_uid)).first()
+    if not target:
+        target = UserVerification(uid=payload.target_uid)
+
+    target.email_verified = target.email_verified or source.email_verified
+    target.phone_verified = target.phone_verified or source.phone_verified
+    target.updated_at = datetime.utcnow()
+
+    session.add(target)
+    session.commit()
+    session.refresh(target)
+
+    return {
+        "success": True,
+        "uid": target.uid,
+        "email_verified": target.email_verified,
+        "phone_verified": target.phone_verified,
+        "is_verified": target.email_verified or target.phone_verified,
+    }
+
+
 @app.post("/users/")
 def create_or_update_user(user_data: UserRequest, session: Session = Depends(get_session)):
     """Create or update a user record from frontend auth sync."""
     if not user_data.uid or not user_data.email:
         raise HTTPException(status_code=400, detail="uid and email are required")
 
-    statement = select(User).where(User.uid == user_data.uid)
-    user = session.exec(statement).first()
+    user = session.exec(select(User).where(User.uid == user_data.uid)).first()
+
+    if not user:
+        user = session.exec(select(User).where(User.email == user_data.email)).first()
+
+    if not user and user_data.phone:
+        user = session.exec(select(User).where(User.phone == user_data.phone)).first()
 
     if user:
+        user.uid = user_data.uid
         user.email = user_data.email
         user.display_name = user_data.display_name
         user.phone = user_data.phone
@@ -108,10 +479,17 @@ def create_or_update_user(user_data: UserRequest, session: Session = Depends(get
         user.latitude = user_data.latitude
         user.longitude = user_data.longitude
         user.last_active_at = datetime.utcnow()
-        session.add(user)
-        session.commit()
-        session.refresh(user)
-        return {"status": "updated", "user": user}
+        try:
+            session.add(user)
+            session.commit()
+            session.refresh(user)
+            return {"status": "updated", "user": user}
+        except IntegrityError:
+            session.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail="A user with this email or phone already exists.",
+            )
 
     new_user = User(
         uid=user_data.uid,
@@ -123,10 +501,35 @@ def create_or_update_user(user_data: UserRequest, session: Session = Depends(get
         longitude=user_data.longitude,
         credits=250000,
     )
-    session.add(new_user)
-    session.commit()
-    session.refresh(new_user)
-    return {"status": "created", "user": new_user}
+    try:
+        session.add(new_user)
+        session.commit()
+        session.refresh(new_user)
+        return {"status": "created", "user": new_user}
+    except IntegrityError:
+        session.rollback()
+        existing = session.exec(select(User).where(User.email == user_data.email)).first()
+        if not existing and user_data.phone:
+            existing = session.exec(select(User).where(User.phone == user_data.phone)).first()
+
+        if existing:
+            existing.uid = user_data.uid
+            existing.email = user_data.email
+            existing.display_name = user_data.display_name
+            existing.phone = user_data.phone
+            existing.photo_url = user_data.photo_url
+            existing.latitude = user_data.latitude
+            existing.longitude = user_data.longitude
+            existing.last_active_at = datetime.utcnow()
+            session.add(existing)
+            session.commit()
+            session.refresh(existing)
+            return {"status": "updated", "user": existing}
+
+        raise HTTPException(
+            status_code=409,
+            detail="A user with this email or phone already exists.",
+        )
 
 class RouteRequest(BaseModel):
     origin_lat: float

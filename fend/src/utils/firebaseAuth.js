@@ -1,5 +1,6 @@
 import {
   createUserWithEmailAndPassword,
+  fetchSignInMethodsForEmail,
   GoogleAuthProvider,
   deleteUser,
   linkWithCredential,
@@ -24,6 +25,11 @@ const DEFAULT_TRANSPORT_TIMES = {
   evening: false,
   night: false,
 };
+
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const E164_PHONE_REGEX = /^\+[1-9]\d{7,14}$/;
+const PASSWORD_REGEX =
+  /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[^A-Za-z\d]).{6,10}$/;
 
 const normalizePreferences = (preferences = {}) => ({
   gender: preferences.gender || "",
@@ -73,6 +79,43 @@ const clearPendingGoogleCredential = () => {
   sessionStorage.removeItem(PENDING_GOOGLE_LINK_KEY);
 };
 
+const isValidEmail = (email) => EMAIL_REGEX.test((email || "").trim());
+
+const normalizePhone = (phone) => (phone || "").trim().replace(/\s+/g, "");
+
+const isValidPhone = (phone) => E164_PHONE_REGEX.test(normalizePhone(phone));
+
+const isStrongPassword = (password) => PASSWORD_REGEX.test(password || "");
+
+const phoneToSyntheticEmailFromDigits = (digits) => {
+  const cleanedDigits = (digits || "").replace(/\D/g, "");
+  return `phone_${cleanedDigits}@safepath.local`;
+};
+
+const phoneToSyntheticEmail = (phone) => {
+  const digits = normalizePhone(phone)
+    .replace(/[^\d+]/g, "")
+    .replace(/^\+/, "");
+  return `phone_${digits}@safepath.local`;
+};
+
+const phoneToSyntheticEmailNational = (phone) => {
+  const digits = normalizePhone(phone).replace(/\D/g, "");
+  const nationalDigits = digits.slice(-10);
+  return phoneToSyntheticEmailFromDigits(nationalDigits);
+};
+
+const extractPhoneFromSyntheticEmail = (email) => {
+  const normalizedEmail = (email || "").trim().toLowerCase();
+  const match = normalizedEmail.match(/^phone_(\d+)@safepath\.local$/);
+  if (!match) return null;
+
+  const digits = match[1];
+  if (!digits) return null;
+
+  return `+${digits}`;
+};
+
 // ─── Sync user to backend (best-effort, never blocks auth) ───────────────────
 const syncUserToBackend = async (userPayload) => {
   try {
@@ -101,6 +144,195 @@ const fetchUserFromBackend = async (uid) => {
   }
 };
 
+export const sendVerificationOtp = async ({ uid, channel, email, phone }) => {
+  try {
+    const response = await fetch(`${API_BASE_URL}/auth/otp/send`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ uid, channel, email, phone }),
+    });
+
+    const data = await response.json();
+    if (!response.ok) {
+      return { success: false, message: data.detail || "Could not send OTP" };
+    }
+
+    return { success: true, ...data };
+  } catch (error) {
+    return { success: false, message: "Could not send OTP. Please try again." };
+  }
+};
+
+export const verifyRegistrationOtp = async ({ uid, channel, otp }) => {
+  try {
+    const response = await fetch(`${API_BASE_URL}/auth/otp/verify`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ uid, channel, otp }),
+    });
+
+    const data = await response.json();
+    if (!response.ok) {
+      return { success: false, message: data.detail || "Invalid OTP" };
+    }
+
+    return { success: true, ...data };
+  } catch (error) {
+    return {
+      success: false,
+      message: "Could not verify OTP. Please try again.",
+    };
+  }
+};
+
+export const getVerificationStatus = async (uid) => {
+  try {
+    const response = await fetch(
+      `${API_BASE_URL}/auth/verification-status/${uid}`,
+    );
+    if (!response.ok) {
+      return { success: false, is_verified: true };
+    }
+
+    const data = await response.json();
+    return { success: true, ...data };
+  } catch (error) {
+    // Fail-open for network issues to avoid locking out valid users.
+    return { success: false, is_verified: true };
+  }
+};
+
+export const transferVerificationStatus = async ({ sourceUid, targetUid }) => {
+  try {
+    const response = await fetch(`${API_BASE_URL}/auth/verification/transfer`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ source_uid: sourceUid, target_uid: targetUid }),
+    });
+
+    const data = await response.json();
+    if (!response.ok) {
+      return {
+        success: false,
+        message: data.detail || "Could not transfer verification",
+      };
+    }
+
+    return { success: true, ...data };
+  } catch (error) {
+    return {
+      success: false,
+      message: "Could not transfer verification status. Please try again.",
+    };
+  }
+};
+
+export const checkRegistrationIdentifiers = async ({ email, phone }) => {
+  const normalizedEmail = (email || "").trim().toLowerCase();
+  const normalizedPhone = normalizePhone(phone || "");
+
+  try {
+    if (normalizedEmail && isValidEmail(normalizedEmail)) {
+      const methods = await fetchSignInMethodsForEmail(auth, normalizedEmail);
+      if (methods.length > 0) {
+        return {
+          exists: true,
+          message: "An account with this email already exists. Please login.",
+        };
+      }
+    }
+
+    if (normalizedPhone && isValidPhone(normalizedPhone)) {
+      try {
+        const response = await fetch(
+          `${API_BASE_URL}/auth/resolve-identifier`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ identifier: normalizedPhone }),
+          },
+        );
+
+        if (response.ok) {
+          return {
+            exists: true,
+            message:
+              "An account with this phone number already exists. Please login.",
+          };
+        }
+      } catch (error) {
+        // Ignore backend check failure and continue Firebase checks.
+      }
+
+      const phoneCandidates = [
+        phoneToSyntheticEmail(normalizedPhone),
+        phoneToSyntheticEmailNational(normalizedPhone),
+      ];
+
+      for (const candidate of [...new Set(phoneCandidates)]) {
+        const methods = await fetchSignInMethodsForEmail(auth, candidate);
+        if (methods.length > 0) {
+          return {
+            exists: true,
+            message:
+              "An account with this phone number already exists. Please login.",
+          };
+        }
+      }
+    }
+
+    return { exists: false };
+  } catch (error) {
+    // Non-blocking check failure should not prevent registration.
+    return { exists: false };
+  }
+};
+
+const resolveIdentifierForLogin = async (identifier) => {
+  const normalizedIdentifier = (identifier || "").trim();
+
+  if (!normalizedIdentifier) {
+    return {
+      success: false,
+      message: "Email or phone and password are required",
+    };
+  }
+
+  if (isValidEmail(normalizedIdentifier)) {
+    return { success: true, email: normalizedIdentifier.toLowerCase() };
+  }
+
+  const normalizedPhone = normalizePhone(normalizedIdentifier);
+  if (!isValidPhone(normalizedPhone)) {
+    return { success: false, message: "Enter a valid email or phone number" };
+  }
+
+  try {
+    const response = await fetch(`${API_BASE_URL}/auth/resolve-identifier`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ identifier: normalizedPhone }),
+    });
+
+    const data = await response.json();
+    if (!response.ok) {
+      const detail = data.detail || "No account found";
+
+      if (response.status === 404 || response.status >= 500) {
+        // Fallback for phone-first accounts when backend profile sync is missing.
+        return { success: true, email: phoneToSyntheticEmail(normalizedPhone) };
+      }
+
+      return { success: false, message: detail };
+    }
+
+    return { success: true, email: (data.email || "").toLowerCase() };
+  } catch (error) {
+    // Fail-soft fallback for temporary backend outages.
+    return { success: true, email: phoneToSyntheticEmail(normalizedPhone) };
+  }
+};
+
 const buildUserProfileData = (firebaseUser, profileData = {}) => ({
   uid: firebaseUser.uid,
   fullName:
@@ -110,7 +342,10 @@ const buildUserProfileData = (firebaseUser, profileData = {}) => ({
     firebaseUser.email?.split("@")[0] ||
     "User",
   email: profileData.email || firebaseUser.email || "",
-  phone: profileData.phone ?? null,
+  phone:
+    profileData.phone ??
+    extractPhoneFromSyntheticEmail(profileData.email || firebaseUser.email) ??
+    null,
   credits: profileData.credits ?? 250000,
   latitude: profileData.latitude ?? null,
   longitude: profileData.longitude ?? null,
@@ -135,12 +370,15 @@ const syncFirebaseUserProfile = async (firebaseUser, overrides = {}) => {
     }
 
     const firestoreData = userDocSnap.data();
+    const inferredPhone =
+      firestoreData.phone ||
+      extractPhoneFromSyntheticEmail(firestoreData.email || firebaseUser.email);
 
     await syncUserToBackend({
       uid: firebaseUser.uid,
       email: firestoreData.email || firebaseUser.email,
       display_name: firestoreData.fullName || firebaseUser.displayName,
-      phone: firestoreData.phone || null,
+      phone: inferredPhone || null,
       photo_url: firebaseUser.photoURL || null,
     });
 
@@ -150,11 +388,15 @@ const syncFirebaseUserProfile = async (firebaseUser, overrides = {}) => {
   const backendUser = await fetchUserFromBackend(firebaseUser.uid);
 
   if (backendUser) {
+    const inferredPhone =
+      backendUser.phone ||
+      extractPhoneFromSyntheticEmail(backendUser.email || firebaseUser.email);
+
     await syncUserToBackend({
       uid: firebaseUser.uid,
       email: backendUser.email || firebaseUser.email,
       display_name: backendUser.display_name || firebaseUser.displayName,
-      phone: backendUser.phone || null,
+      phone: inferredPhone || null,
       photo_url: firebaseUser.photoURL || null,
     });
 
@@ -169,7 +411,10 @@ const syncFirebaseUserProfile = async (firebaseUser, overrides = {}) => {
       firebaseUser.email?.split("@")[0] ||
       "User",
     email: overrides.email || firebaseUser.email || "",
-    phone: overrides.phone ?? null,
+    phone:
+      overrides.phone ??
+      extractPhoneFromSyntheticEmail(firebaseUser.email) ??
+      null,
     credits: 250000,
     createdAt: new Date().toISOString(),
     lastActiveAt: new Date().toISOString(),
@@ -211,20 +456,59 @@ const syncFirebaseUserProfile = async (firebaseUser, overrides = {}) => {
  * instead of leaving the user stuck.
  */
 export const registerUser = async (userData) => {
-  const { fullName, email, phone, password } = userData;
+  const {
+    fullName,
+    email,
+    phone,
+    password,
+    otpChannel = "email",
+    skipOtp = false,
+    verificationSourceUid = null,
+  } = userData;
 
   const normalizedEmail = (email || "").trim().toLowerCase();
   const normalizedName = (fullName || "").trim();
-  const normalizedPhone = (phone || "").trim();
+  const normalizedPhone = normalizePhone(phone);
+  const hasEmail = Boolean(normalizedEmail);
+  const hasPhone = Boolean(normalizedPhone);
 
   // Basic validation
-  if (!normalizedName || !normalizedEmail || !normalizedPhone || !password) {
-    return { success: false, message: "All fields are required" };
+  if (!normalizedName || !password) {
+    return { success: false, message: "Full name and password are required" };
   }
-  if (password.length < 6) {
+  if (!hasEmail && !hasPhone) {
     return {
       success: false,
-      message: "Password must be at least 6 characters",
+      message: "Provide at least email or phone number",
+    };
+  }
+  if (hasEmail && !isValidEmail(normalizedEmail)) {
+    return { success: false, message: "Enter a valid email address" };
+  }
+  if (hasPhone && !isValidPhone(normalizedPhone)) {
+    return {
+      success: false,
+      message: "Phone must be in international format like +14155552671",
+    };
+  }
+  if (!isStrongPassword(password)) {
+    return {
+      success: false,
+      message:
+        "Password must be 6-10 chars and include upper, lower, number, and special character",
+    };
+  }
+
+  const firebaseEmail = hasEmail
+    ? normalizedEmail
+    : phoneToSyntheticEmail(normalizedPhone);
+  const verificationChannel =
+    otpChannel === "phone" && hasPhone ? "phone" : "email";
+
+  if (verificationChannel === "email" && !hasEmail) {
+    return {
+      success: false,
+      message: "Email is required when OTP channel is email",
     };
   }
 
@@ -232,7 +516,7 @@ export const registerUser = async (userData) => {
     // Firebase Auth registration
     const userCredential = await createUserWithEmailAndPassword(
       auth,
-      normalizedEmail,
+      firebaseEmail,
       password,
     );
     const user = userCredential.user;
@@ -247,8 +531,8 @@ export const registerUser = async (userData) => {
     const userDoc = {
       id: userId,
       fullName: normalizedName,
-      email: normalizedEmail,
-      phone: normalizedPhone,
+      email: hasEmail ? normalizedEmail : firebaseEmail,
+      phone: hasPhone ? normalizedPhone : null,
       credits: 250000,
       createdAt: new Date().toISOString(),
       lastActiveAt: new Date().toISOString(),
@@ -268,9 +552,9 @@ export const registerUser = async (userData) => {
     // Sync to backend (best-effort — never blocks)
     const backendSaved = await syncUserToBackend({
       uid: user.uid,
-      email: normalizedEmail,
+      email: hasEmail ? normalizedEmail : firebaseEmail,
       display_name: normalizedName,
-      phone: normalizedPhone,
+      phone: hasPhone ? normalizedPhone : null,
       photo_url: user.photoURL,
     });
 
@@ -299,13 +583,68 @@ export const registerUser = async (userData) => {
       };
     }
 
+    if (!skipOtp) {
+      const otpSendResult = await sendVerificationOtp({
+        uid: user.uid,
+        channel: verificationChannel,
+        email: hasEmail ? normalizedEmail : null,
+        phone: hasPhone ? normalizedPhone : null,
+      });
+
+      // Keep the session un-authenticated until OTP verification is complete.
+      await signOut(auth);
+
+      if (!otpSendResult.success) {
+        return {
+          success: false,
+          message:
+            otpSendResult.message ||
+            "Account created but OTP could not be sent",
+        };
+      }
+
+      return {
+        success: true,
+        requiresVerification: true,
+        verification: {
+          uid: user.uid,
+          channel: otpSendResult.channel,
+          destination: otpSendResult.destination,
+        },
+        user: {
+          uid: user.uid,
+          fullName: normalizedName,
+          email: hasEmail ? normalizedEmail : null,
+          phone: hasPhone ? normalizedPhone : null,
+          credits: 250000,
+        },
+      };
+    }
+
+    if (verificationSourceUid) {
+      const transferResult = await transferVerificationStatus({
+        sourceUid: verificationSourceUid,
+        targetUid: user.uid,
+      });
+
+      if (!transferResult.success) {
+        return {
+          success: false,
+          message:
+            transferResult.message ||
+            "Account created but verification mapping failed",
+        };
+      }
+    }
+
     return {
       success: true,
+      requiresVerification: false,
       user: {
         uid: user.uid,
         fullName: normalizedName,
-        email: normalizedEmail,
-        phone: normalizedPhone,
+        email: hasEmail ? normalizedEmail : null,
+        phone: hasPhone ? normalizedPhone : null,
         credits: 250000,
       },
     };
@@ -392,20 +731,77 @@ export const signInWithGoogle = async () => {
  * Login user.
  * Backend sync is best-effort — login succeeds even if backend is unreachable.
  */
-export const loginUser = async (email, password) => {
+export const loginUser = async (identifier, password) => {
   try {
-    const normalizedEmail = (email || "").trim().toLowerCase();
+    const normalizedIdentifier = (identifier || "").trim();
     const normalizedPassword = (password || "").trim();
 
-    if (!normalizedEmail || !normalizedPassword) {
-      return { success: false, message: "Email and password are required" };
+    if (!normalizedIdentifier || !normalizedPassword) {
+      return {
+        success: false,
+        message: "Email or phone and password are required",
+      };
     }
 
-    const userCredential = await signInWithEmailAndPassword(
-      auth,
-      normalizedEmail,
-      normalizedPassword,
-    );
+    const emailCandidates = [];
+
+    if (isValidEmail(normalizedIdentifier)) {
+      emailCandidates.push(normalizedIdentifier.toLowerCase());
+    } else {
+      const normalizedPhone = normalizePhone(normalizedIdentifier);
+      if (!isValidPhone(normalizedPhone)) {
+        return {
+          success: false,
+          message: "Enter a valid email or phone number",
+        };
+      }
+
+      const resolved = await resolveIdentifierForLogin(normalizedPhone);
+      if (resolved.success && resolved.email) {
+        emailCandidates.push((resolved.email || "").toLowerCase());
+      }
+
+      // Fallback for phone-first accounts where backend profile mapping is missing/outdated.
+      emailCandidates.push(phoneToSyntheticEmail(normalizedPhone));
+      emailCandidates.push(phoneToSyntheticEmailNational(normalizedPhone));
+    }
+
+    const uniqueCandidates = [...new Set(emailCandidates.filter(Boolean))];
+    if (uniqueCandidates.length === 0) {
+      return { success: false, message: "No account found" };
+    }
+
+    let userCredential = null;
+    let lastAuthError = null;
+
+    for (const candidateEmail of uniqueCandidates) {
+      try {
+        userCredential = await signInWithEmailAndPassword(
+          auth,
+          candidateEmail,
+          normalizedPassword,
+        );
+        break;
+      } catch (attemptError) {
+        lastAuthError = attemptError;
+
+        const retryableCodes = [
+          "auth/user-not-found",
+          "auth/wrong-password",
+          "auth/invalid-email",
+          "auth/invalid-credential",
+        ];
+
+        if (!retryableCodes.includes(attemptError.code)) {
+          throw attemptError;
+        }
+      }
+    }
+
+    if (!userCredential) {
+      throw lastAuthError || new Error("auth/invalid-credential");
+    }
+
     const user = userCredential.user;
 
     const pendingGoogleCredential = getPendingGoogleCredential();
@@ -416,6 +812,17 @@ export const loginUser = async (email, password) => {
         console.warn("Could not link Google account:", linkError);
       }
       clearPendingGoogleCredential();
+    }
+
+    const verificationStatus = await getVerificationStatus(user.uid);
+    if (!verificationStatus.is_verified) {
+      await signOut(auth);
+      return {
+        success: false,
+        needsVerification: true,
+        uid: user.uid,
+        message: "Please verify your account before logging in.",
+      };
     }
 
     const userData = await syncFirebaseUserProfile(user);
@@ -473,6 +880,19 @@ export const getCurrentUser = async () => {
       }
 
       try {
+        const verificationStatus = await getVerificationStatus(
+          firebaseUser.uid,
+        );
+        if (!verificationStatus.is_verified) {
+          try {
+            await signOut(auth);
+          } catch (signOutError) {
+            console.warn("Could not sign out unverified user:", signOutError);
+          }
+          resolve(null);
+          return;
+        }
+
         const userData = await syncFirebaseUserProfile(firebaseUser);
         resolve(userData);
       } catch (error) {
@@ -513,6 +933,10 @@ export const updateUserPreferences = async (userId, updates = {}) => {
 
     if (typeof updates.fullName !== "undefined") {
       payload.fullName = (updates.fullName || "").trim();
+    }
+
+    if (typeof updates.phone !== "undefined") {
+      payload.phone = updates.phone ? normalizePhone(updates.phone) : null;
     }
 
     if (typeof updates.emergencyContactNumber !== "undefined") {
