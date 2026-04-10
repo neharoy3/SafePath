@@ -311,8 +311,7 @@ export const getVerificationStatus = async (uid) => {
       is_verified: false,
       is_legacy_user: false,
       message:
-        error?.message ||
-        "Could not verify account status. Please try again.",
+        error?.message || "Could not verify account status. Please try again.",
     };
   }
 };
@@ -640,7 +639,9 @@ export const registerUser = async (userData) => {
 
   try {
     if (!skipOtp) {
-      const uid = verificationSourceUid || `pending_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+      const uid =
+        verificationSourceUid ||
+        `pending_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
       const otpSendResult = await sendVerificationOtp({
         uid,
         channel: verificationChannel,
@@ -675,7 +676,10 @@ export const registerUser = async (userData) => {
       };
     }
 
-    const uid = verificationSourceUid || userData.uid || `user_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+    const uid =
+      verificationSourceUid ||
+      userData.uid ||
+      `user_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
     const backendEmail = hasEmail ? normalizedEmail : firebaseEmail;
 
     const response = await fetch(`${API_BASE_URL}/users/`, {
@@ -695,7 +699,8 @@ export const registerUser = async (userData) => {
       return {
         success: false,
         message:
-          responseData.detail || "Registration failed. Could not save the account profile.",
+          responseData.detail ||
+          "Registration failed. Could not save the account profile.",
       };
     }
 
@@ -715,7 +720,9 @@ export const registerUser = async (userData) => {
       await setDoc(
         doc(db, "users", uid),
         {
-          id: createdUser.id || `${new Date().getFullYear()}-${Math.floor(1000 + Math.random() * 9000)}_${uid}`,
+          id:
+            createdUser.id ||
+            `${new Date().getFullYear()}-${Math.floor(1000 + Math.random() * 9000)}_${uid}`,
           fullName: normalizedName,
           email: backendEmail,
           phone: hasPhone ? normalizedPhone : null,
@@ -726,7 +733,10 @@ export const registerUser = async (userData) => {
         { merge: true },
       );
     } catch (firestoreError) {
-      console.warn("Could not mirror OTP registration to Firestore:", firestoreError);
+      console.warn(
+        "Could not mirror OTP registration to Firestore:",
+        firestoreError,
+      );
     }
 
     return {

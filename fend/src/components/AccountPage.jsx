@@ -425,7 +425,10 @@ const AccountPage = () => {
         }
       } catch (backendSyncError) {
         backendSyncSucceeded = false;
-        console.warn("Email OTP verification succeeded, but backend sync failed:", backendSyncError);
+        console.warn(
+          "Email OTP verification succeeded, but backend sync failed:",
+          backendSyncError,
+        );
       }
 
       setProfile((prev) => (prev ? { ...prev, email: normalizedEmail } : prev));

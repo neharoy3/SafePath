@@ -322,7 +322,10 @@ const AuthPage = ({ setIsAuthenticated }) => {
     const loginPassword =
       loginMethod === "phone" ? loginPhonePassword : loginEmailPassword;
 
-    if (loginMethod === "phone" && !isValidNationalPhone(loginPhone, loginCountryCode)) {
+    if (
+      loginMethod === "phone" &&
+      !isValidNationalPhone(loginPhone, loginCountryCode)
+    ) {
       setError(
         `Enter a valid ${getNationalPhoneLengthHint(loginCountryCode)} digit phone number for the selected country code`,
       );
@@ -793,7 +796,9 @@ const AuthPage = ({ setIsAuthenticated }) => {
                     <button
                       type="button"
                       onClick={() => setOtpChannel("phone")}
-                      disabled={!isValidNationalPhone(formData.phone, phoneCountryCode)}
+                      disabled={
+                        !isValidNationalPhone(formData.phone, phoneCountryCode)
+                      }
                       className={`rounded-xl border px-4 py-2 text-sm font-medium transition-all ${
                         otpChannel === "phone"
                           ? "border-blue-500 bg-blue-600 text-white"
